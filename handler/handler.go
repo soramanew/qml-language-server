@@ -6,11 +6,18 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/odvcencio/gotreesitter"
 	"github.com/owenrumney/go-lsp/lsp"
 	"github.com/owenrumney/go-lsp/server"
 )
+
+// qmllintTimeout bounds a single qmllint invocation. A cold run that has to
+// load plugins and walk QML_IMPORT_PATH typically finishes well under a
+// second; ten seconds is a generous cap to cover very large projects before
+// we give up and show tree-sitter diagnostics only.
+const qmllintTimeout = 10 * time.Second
 
 type Handler struct {
 	logger *slog.Logger
@@ -21,6 +28,11 @@ type Handler struct {
 	parser    *QMLParser
 	server    *server.Server
 	workspace *workspaceIndex
+
+	qmllint *qmllintRunner
+
+	lintMu      sync.Mutex
+	lintCancels map[lsp.DocumentURI]context.CancelFunc
 }
 
 func New(logger *slog.Logger) *Handler {
@@ -29,10 +41,12 @@ func New(logger *slog.Logger) *Handler {
 		logger.Error("failed to load QML grammar; all language features will be disabled")
 	}
 	return &Handler{
-		logger:    logger,
-		documents: make(map[lsp.DocumentURI]string),
-		parser:    parser,
-		workspace: newWorkspaceIndex(),
+		logger:      logger,
+		documents:   make(map[lsp.DocumentURI]string),
+		parser:      parser,
+		workspace:   newWorkspaceIndex(),
+		qmllint:     newQmllintRunner(logger),
+		lintCancels: make(map[lsp.DocumentURI]context.CancelFunc),
 	}
 }
 
@@ -150,9 +164,66 @@ func (h *Handler) reparseAndPublish(uri lsp.DocumentURI, text string) {
 	h.publishDiagnostics(uri, h.getDiagnostics(uri))
 }
 
+// startLint kicks off a background qmllint run for uri. A previous in-flight
+// lint for the same URI is cancelled first so we never surface stale results
+// after the user keeps typing. Safe to call when qmllint is unavailable or
+// the URI isn't a local file — both are no-ops.
+func (h *Handler) startLint(uri lsp.DocumentURI) {
+	if h.qmllint == nil {
+		return
+	}
+	path := uriToPath(uri)
+	if path == "" {
+		return
+	}
+	importPaths := h.lintImportPaths()
+	h.cancelLint(uri)
+	ctx, cancel := context.WithTimeout(context.Background(), qmllintTimeout)
+	h.lintMu.Lock()
+	h.lintCancels[uri] = cancel
+	h.lintMu.Unlock()
+	go func() {
+		defer cancel()
+		lintDiags := h.qmllint.Lint(ctx, path, importPaths)
+		if ctx.Err() != nil {
+			return
+		}
+		tsDiags := h.getDiagnostics(uri)
+		// Re-check after the (possibly slow) subprocess returned: if the user
+		// edited the file in the meantime DidChange cancelled our context and
+		// already republished fresh tree-sitter diagnostics — we must not
+		// overwrite those with lint results tied to the previous text.
+		if ctx.Err() != nil {
+			return
+		}
+		combined := make([]lsp.Diagnostic, 0, len(tsDiags)+len(lintDiags))
+		combined = append(combined, tsDiags...)
+		combined = append(combined, lintDiags...)
+		h.publishDiagnostics(uri, combined)
+		// Only clear our own entry. If something cancelled us between publish
+		// and now and then installed a newer lint, we'd otherwise delete that
+		// newer run's cancel and leak a goroutine past DidClose.
+		h.lintMu.Lock()
+		if ctx.Err() == nil {
+			delete(h.lintCancels, uri)
+		}
+		h.lintMu.Unlock()
+	}()
+}
+
+func (h *Handler) cancelLint(uri lsp.DocumentURI) {
+	h.lintMu.Lock()
+	defer h.lintMu.Unlock()
+	if cancel, ok := h.lintCancels[uri]; ok {
+		cancel()
+		delete(h.lintCancels, uri)
+	}
+}
+
 func (h *Handler) DidOpen(_ context.Context, params *lsp.DidOpenTextDocumentParams) error {
 	h.setDocument(params.TextDocument.URI, params.TextDocument.Text)
 	h.reparseAndPublish(params.TextDocument.URI, params.TextDocument.Text)
+	h.startLint(params.TextDocument.URI)
 	if h.workspace != nil {
 		h.workspace.registerURI(params.TextDocument.URI)
 	}
@@ -167,12 +238,16 @@ func (h *Handler) DidChange(_ context.Context, params *lsp.DidChangeTextDocument
 	}
 	text := params.ContentChanges[len(params.ContentChanges)-1].Text
 	h.setDocument(params.TextDocument.URI, text)
+	// Cancel any in-flight lint: its results would reflect the pre-edit file
+	// on disk and arrive after the user has already moved on.
+	h.cancelLint(params.TextDocument.URI)
 	h.reparseAndPublish(params.TextDocument.URI, text)
 	return nil
 }
 
 func (h *Handler) DidClose(_ context.Context, params *lsp.DidCloseTextDocumentParams) error {
 	h.deleteDocument(params.TextDocument.URI)
+	h.cancelLint(params.TextDocument.URI)
 	if h.parser != nil {
 		h.parser.Invalidate(params.TextDocument.URI)
 	}
@@ -186,6 +261,7 @@ func (h *Handler) DidSave(_ context.Context, params *lsp.DidSaveTextDocumentPara
 	}
 	h.setDocument(params.TextDocument.URI, *params.Text)
 	h.reparseAndPublish(params.TextDocument.URI, *params.Text)
+	h.startLint(params.TextDocument.URI)
 	return nil
 }
 
