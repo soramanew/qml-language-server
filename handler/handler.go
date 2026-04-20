@@ -176,7 +176,7 @@ func (h *Handler) startLint(uri lsp.DocumentURI) {
 	if path == "" {
 		return
 	}
-	importPaths := h.lintImportPaths()
+	importPaths := h.lintImportPaths(path)
 	h.cancelLint(uri)
 	ctx, cancel := context.WithTimeout(context.Background(), qmllintTimeout)
 	h.lintMu.Lock()

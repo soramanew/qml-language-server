@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -176,11 +177,19 @@ func warningToDiagnostic(w qmllintWarning) lsp.Diagnostic {
 	return diag
 }
 
-// lintImportPaths returns the absolute -I paths qmllint should search, pulled
-// from the first .qmlls.ini it finds under a workspace root. Relative entries
-// in the ini (e.g. `buildDir=build`) are resolved against the ini's directory
-// rather than the file being linted, matching Qt qmlls's behavior.
-func (h *Handler) lintImportPaths() []string {
+// lintImportPaths returns the absolute -I paths qmllint should search. It
+// looks for a .qmlls.ini first by walking upward from filePath's directory —
+// this finds the config regardless of whether workspace roots have been
+// populated yet (Initialize runs in a goroutine in go-lsp, so the very first
+// DidOpen/DidSave can race ahead of setRoots) — and falls back to scanning
+// the known workspace roots if the walk finds nothing. Relative entries in
+// the ini are resolved against the ini's directory, matching Qt qmlls.
+func (h *Handler) lintImportPaths(filePath string) []string {
+	if iniPath := findIniUpward(filePath); iniPath != "" {
+		if paths := parseIniPaths(iniPath); paths != nil {
+			return paths
+		}
+	}
 	if h == nil || h.workspace == nil {
 		return nil
 	}
@@ -189,21 +198,53 @@ func (h *Handler) lintImportPaths() []string {
 	h.workspace.mu.RUnlock()
 	for _, root := range roots {
 		iniPath := filepath.Join(root, ".qmlls.ini")
-		cfg, err := ParseQMLLSIni(iniPath)
-		if err != nil || cfg == nil {
-			continue
+		if paths := parseIniPaths(iniPath); paths != nil {
+			return paths
 		}
-		iniDir := filepath.Dir(iniPath)
-		var paths []string
-		if cfg.BuildDir != "" {
-			paths = append(paths, resolveIniPath(iniDir, cfg.BuildDir))
-		}
-		for _, p := range cfg.ImportPaths {
-			paths = append(paths, resolveIniPath(iniDir, p))
-		}
-		return paths
 	}
 	return nil
+}
+
+// findIniUpward walks from filePath's directory toward the filesystem root,
+// returning the path of the first .qmlls.ini found. Returns "" when filePath
+// is empty or the walk reaches the root without finding one.
+func findIniUpward(filePath string) string {
+	if filePath == "" {
+		return ""
+	}
+	dir := filepath.Dir(filePath)
+	for {
+		candidate := filepath.Join(dir, ".qmlls.ini")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// parseIniPaths parses an ini file and returns its resolved import paths, or
+// nil if the file is missing/unreadable/empty of import-related keys.
+func parseIniPaths(iniPath string) []string {
+	cfg, err := ParseQMLLSIni(iniPath)
+	if err != nil || cfg == nil {
+		return nil
+	}
+	if cfg.BuildDir == "" && len(cfg.ImportPaths) == 0 {
+		return nil
+	}
+	iniDir := filepath.Dir(iniPath)
+	var paths []string
+	if cfg.BuildDir != "" {
+		paths = append(paths, resolveIniPath(iniDir, cfg.BuildDir))
+	}
+	for _, p := range cfg.ImportPaths {
+		paths = append(paths, resolveIniPath(iniDir, p))
+	}
+	return paths
 }
 
 func resolveIniPath(base, p string) string {

@@ -139,7 +139,7 @@ func TestLintImportPathsReadsQmllsIni(t *testing.T) {
 	h := &Handler{workspace: newWorkspaceIndex()}
 	h.workspace.setRoots([]string{dir})
 
-	got := h.lintImportPaths()
+	got := h.lintImportPaths(filepath.Join(dir, "Foo.qml"))
 	want := []string{filepath.Join(dir, "build"), filepath.Join(dir, "qml"), "/abs/imports"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -155,8 +155,37 @@ func TestLintImportPathsReturnsNilWithoutIni(t *testing.T) {
 	dir := t.TempDir()
 	h := &Handler{workspace: newWorkspaceIndex()}
 	h.workspace.setRoots([]string{dir})
-	if got := h.lintImportPaths(); got != nil {
+	if got := h.lintImportPaths(filepath.Join(dir, "Foo.qml")); got != nil {
 		t.Errorf("got %v, want nil", got)
+	}
+}
+
+// TestLintImportPathsFindsIniBeforeWorkspaceRootsPopulated proves the fix for
+// the race where DidOpen can arrive before Initialize's goroutine runs
+// setRoots: finding the ini must work even when workspace.roots is empty.
+func TestLintImportPathsFindsIniBeforeWorkspaceRootsPopulated(t *testing.T) {
+	dir := t.TempDir()
+	ini := "[General]\nbuildDir=build\nimportPaths=qml\n"
+	if err := os.WriteFile(filepath.Join(dir, ".qmlls.ini"), []byte(ini), 0o644); err != nil {
+		t.Fatalf("write ini: %v", err)
+	}
+	// Workspace deliberately has NO roots — mimics the pre-Initialize state.
+	h := &Handler{workspace: newWorkspaceIndex()}
+
+	// File sits two directories below the ini.
+	sub := filepath.Join(dir, "ui", "widgets")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	got := h.lintImportPaths(filepath.Join(sub, "Button.qml"))
+	want := []string{filepath.Join(dir, "build"), filepath.Join(dir, "qml")}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("paths[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }
 
