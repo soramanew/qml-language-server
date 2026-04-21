@@ -96,7 +96,18 @@ func TestChainCompletionWalksMultiLevel(t *testing.T) {
 }
 
 func TestChainCompletionTerminalAnchorsOffersAnchors(t *testing.T) {
-	doc := "import QtQuick\n\nRectangle {\n    id: rect\n    width: rect.anchors.\n}\n"
+	// The chain walker special-cases `anchors` as a terminal segment and
+	// calls getAnchorCompletions() unconditionally. Seed two anchor entries
+	// so the lookup returns something observable.
+	registerSymbols(
+		QMLSymbol{Label: "syntheticAnchorFill", Kind: lsp.CompletionItemKindProperty, Category: "anchor"},
+		QMLSymbol{Label: "syntheticAnchorCenterIn", Kind: lsp.CompletionItemKindProperty, Category: "anchor"},
+	)
+
+	typeProperties["AnchorHost"] = []QMLSymbol{}
+	defer delete(typeProperties, "AnchorHost")
+
+	doc := "import FakeModule\n\nAnchorHost {\n    id: rect\n    width: rect.anchors.\n}\n"
 	uri := lsp.DocumentURI("test://anchors-chain.qml")
 	h := newTestHandler(t, uri, doc)
 
@@ -109,7 +120,7 @@ func TestChainCompletionTerminalAnchorsOffersAnchors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
-	needed := map[string]bool{"fill": false, "centerIn": false, "top": false}
+	needed := map[string]bool{"syntheticAnchorFill": false, "syntheticAnchorCenterIn": false}
 	for _, item := range list.Items {
 		if _, want := needed[item.Label]; want {
 			needed[item.Label] = true
@@ -123,12 +134,21 @@ func TestChainCompletionTerminalAnchorsOffersAnchors(t *testing.T) {
 }
 
 func TestChainCompletionBrokenChainFallsBack(t *testing.T) {
+	// When the chain can't be resolved (group-typed intermediate), the
+	// completion path falls back to qmlPropertyCompletions. Seed a
+	// distinctive entry so we can detect that the fallback kicked in.
+	registerSymbols(QMLSymbol{
+		Label:    "fallbackMarker",
+		Kind:     lsp.CompletionItemKindProperty,
+		Category: "property",
+	})
+
 	typeProperties["ChainA"] = []QMLSymbol{
 		{Label: "mystery", Signature: "ChainA.mystery: group", Category: "property"},
 	}
 	defer delete(typeProperties, "ChainA")
 
-	doc := "import QtQuick\n\nChainA {\n    id: a\n    width: a.mystery.broken.\n}\n"
+	doc := "import FakeModule\n\nChainA {\n    id: a\n    width: a.mystery.broken.\n}\n"
 	uri := lsp.DocumentURI("test://broken.qml")
 	h := newTestHandler(t, uri, doc)
 
@@ -141,16 +161,10 @@ func TestChainCompletionBrokenChainFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
-	// Broken chain -> fallback to generic property completions (qmlPropertyCompletions).
-	// `id` is a universal property so it should always be present.
-	foundID := false
 	for _, item := range list.Items {
-		if item.Label == "id" {
-			foundID = true
-			break
+		if item.Label == "fallbackMarker" {
+			return
 		}
 	}
-	if !foundID {
-		t.Errorf("expected fallback to generic properties, `id` missing from %d items", len(list.Items))
-	}
+	t.Errorf("expected fallbackMarker in generic fallback; got %d items", len(list.Items))
 }

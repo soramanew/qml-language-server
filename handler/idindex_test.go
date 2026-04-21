@@ -103,14 +103,21 @@ func TestCompletionAfterIdDotReturnsTypeProperties(t *testing.T) {
 
 func TestCompletionAfterUnknownDotFallsBack(t *testing.T) {
 	// `foo.` where foo isn't an id should fall back to generic property
-	// completions (e.g. `width`, `height`).
-	doc := "import QtQuick\n\nRectangle {\n    width: foo.\n}\n"
+	// completions from the registry — seed a distinctive marker since no
+	// properties are hard-coded anymore.
+	registerSymbols(QMLSymbol{
+		Label:    "unknownDotFallbackMarker",
+		Kind:     lsp.CompletionItemKindProperty,
+		Category: "property",
+	})
+
+	doc := "BodyHost {\n    width: foo.\n}\n"
 	h := newTestHandler(t, "test://unk.qml", doc)
 
 	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 			TextDocument: lsp.TextDocumentIdentifier{URI: "test://unk.qml"},
-			Position:     lsp.Position{Line: 3, Character: 15}, // line 3 = `    width: foo.`
+			Position:     lsp.Position{Line: 1, Character: 15},
 		},
 	})
 	if err != nil {
@@ -118,12 +125,12 @@ func TestCompletionAfterUnknownDotFallsBack(t *testing.T) {
 	}
 	foundWidth := false
 	for _, item := range list.Items {
-		if item.Label == "width" {
+		if item.Label == "unknownDotFallbackMarker" {
 			foundWidth = true
 			break
 		}
 	}
 	if !foundWidth {
-		t.Errorf("expected generic `width` in fallback completions, got %d items", len(list.Items))
+		t.Errorf("expected unknownDotFallbackMarker in fallback completions, got %d items", len(list.Items))
 	}
 }

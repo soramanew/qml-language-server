@@ -164,6 +164,15 @@ func TestHandlerErrorWithCause(t *testing.T) {
 }
 
 func TestQMLTypeInfo(t *testing.T) {
+	// Inject a fake type into the registry so the lookup path is exercised
+	// without relying on qmltypes discovery having run.
+	registerSymbols(QMLSymbol{
+		Label:    "FakeTypeInfoWidget",
+		Kind:     lsp.CompletionItemKindClass,
+		Module:   "FakeModule",
+		Category: "type",
+	})
+
 	tests := []struct {
 		name       string
 		typeName   string
@@ -171,11 +180,7 @@ func TestQMLTypeInfo(t *testing.T) {
 		wantModule string
 		wantType   string
 	}{
-		{"Rectangle", "Rectangle", true, "QtQuick", "Object"},
-		{"Text", "Text", true, "QtQuick", "Object"},
-		{"Item", "Item", true, "QtQuick", "Object"},
-		{"ColumnLayout", "ColumnLayout", true, "QtQuick.Layouts", "Object"},
-		{"ListElement", "ListElement", true, "QtQml.Models", "Object"},
+		{"injected", "FakeTypeInfoWidget", true, "FakeModule", "Object"},
 		{"Unknown", "UnknownType", false, "", ""},
 		{"Empty", "", false, "", ""},
 	}
@@ -199,17 +204,22 @@ func TestQMLTypeInfo(t *testing.T) {
 }
 
 func TestHoverOnKnownType(t *testing.T) {
-	h := newTestHandler(t, "test://foo.qml", "import QtQuick\n\nRectangle {\n    width: 100\n}\n")
+	// Seed a synthetic type/property so the hover lookup doesn't depend on
+	// qmltypes discovery having populated the registry at startup.
+	registerSymbols(
+		QMLSymbol{Label: "HoverShape", Kind: lsp.CompletionItemKindClass, Module: "FakeModule", Category: "type"},
+		QMLSymbol{Label: "thickness", Kind: lsp.CompletionItemKindProperty, Detail: "real — stroke thickness", Signature: "thickness: real", Category: "property"},
+	)
+
+	h := newTestHandler(t, "test://foo.qml", "HoverShape {\n    thickness: 100\n}\n")
 
 	cases := []struct {
 		name     string
 		pos      lsp.Position
 		wantText string
 	}{
-		{"on type name Rectangle", lsp.Position{Line: 2, Character: 3}, "Rectangle"},
-		{"at end of Rectangle", lsp.Position{Line: 2, Character: 9}, "Rectangle"},
-		{"on property width", lsp.Position{Line: 3, Character: 6}, "width"},
-		{"on import module", lsp.Position{Line: 0, Character: 10}, "QtQuick"},
+		{"on type name", lsp.Position{Line: 0, Character: 3}, "HoverShape"},
+		{"on property", lsp.Position{Line: 1, Character: 6}, "thickness"},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,84 +269,44 @@ func TestCompletionPopulatesDocumentation(t *testing.T) {
 }
 
 func TestCompletionOffersPropertiesInsideObjectBody(t *testing.T) {
-	cases := []struct {
-		name     string
-		doc      string
-		position lsp.Position
-		// generic properties that must always appear inside any body
-		wantGeneric []string
-		// type-specific properties that must appear given the enclosing type
-		wantTypeSpecific []string
-	}{
-		{
-			name: "blank line inside Window",
-			doc:  "import QtQuick\n\nWindow {\n    \n}\n",
-			position: lsp.Position{Line: 3, Character: 4},
-			// Window has its own x/y/width/height/visible/opacity but is NOT
-			// an Item — `anchors` doesn't apply.
-			wantGeneric:      []string{"width", "height"},
-			wantTypeSpecific: []string{"title", "flags", "visibility"},
-		},
-		{
-			name:             "blank line inside Text",
-			doc:              "import QtQuick\n\nText {\n    \n}\n",
-			position:         lsp.Position{Line: 3, Character: 4},
-			wantGeneric:      []string{"width", "height", "anchors"},
-			wantTypeSpecific: []string{"wrapMode", "elide", "textFormat"},
-		},
-		{
-			name:             "mid-word inside Rectangle",
-			doc:              "import QtQuick\n\nRectangle {\n    w\n}\n",
-			position:         lsp.Position{Line: 3, Character: 5},
-			wantGeneric:      []string{"width", "height", "anchors"},
-			wantTypeSpecific: []string{"border", "gradient", "antialiasing"},
-		},
-		{
-			name:             "ApplicationWindow inherits Window props",
-			doc:              "import QtQuick.Controls\n\nApplicationWindow {\n    \n}\n",
-			position:         lsp.Position{Line: 3, Character: 4},
-			wantGeneric:      []string{"width", "height"},
-			wantTypeSpecific: []string{"title", "flags"},
-		},
-		{
-			name:             "nested Text inside Window picks Text props",
-			doc:              "import QtQuick\n\nWindow {\n    Text {\n        \n    }\n}\n",
-			position:         lsp.Position{Line: 4, Character: 8},
-			wantGeneric:      []string{"width", "height"},
-			wantTypeSpecific: []string{"wrapMode", "elide"},
-		},
+	// Inject a synthetic base + derived type to drive the chain-aware
+	// completion path without depending on qmltypes discovery.
+	typeProperties["BodyBase"] = []QMLSymbol{
+		{Label: "baseProp", Category: "property", Signature: "BodyBase.baseProp: real"},
 	}
+	typeProperties["BodyDerived"] = []QMLSymbol{
+		{Label: "derivedProp", Category: "property", Signature: "BodyDerived.derivedProp: string"},
+	}
+	baseTypes["BodyDerived"] = []string{"BodyBase"}
+	registerSymbols(QMLSymbol{Label: "BodyDerived", Kind: lsp.CompletionItemKindClass, Module: "FakeModule", Category: "type"})
+	defer func() {
+		delete(typeProperties, "BodyBase")
+		delete(typeProperties, "BodyDerived")
+		delete(baseTypes, "BodyDerived")
+	}()
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newTestHandler(t, "test://foo.qml", tc.doc)
-			list, err := h.Completion(context.Background(), &lsp.CompletionParams{
-				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-					TextDocument: lsp.TextDocumentIdentifier{URI: "test://foo.qml"},
-					Position:     tc.position,
-				},
-			})
-			if err != nil {
-				t.Fatalf("Completion returned error: %v", err)
-			}
-			if list == nil {
-				t.Fatal("Completion returned nil list")
-			}
-			labels := map[string]bool{}
-			for _, item := range list.Items {
-				labels[item.Label] = true
-			}
-			for _, want := range tc.wantGeneric {
-				if !labels[want] {
-					t.Errorf("expected generic property %q in completions; got %d items", want, len(list.Items))
-				}
-			}
-			for _, want := range tc.wantTypeSpecific {
-				if !labels[want] {
-					t.Errorf("expected type-specific property %q in completions; got %d items", want, len(list.Items))
-				}
-			}
-		})
+	doc := "import FakeModule\n\nBodyDerived {\n    \n}\n"
+	h := newTestHandler(t, "test://foo.qml", doc)
+	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+			TextDocument: lsp.TextDocumentIdentifier{URI: "test://foo.qml"},
+			Position:     lsp.Position{Line: 3, Character: 4},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	if list == nil {
+		t.Fatal("Completion returned nil list")
+	}
+	labels := map[string]bool{}
+	for _, item := range list.Items {
+		labels[item.Label] = true
+	}
+	for _, want := range []string{"baseProp", "derivedProp"} {
+		if !labels[want] {
+			t.Errorf("expected property %q in %d completions", want, len(list.Items))
+		}
 	}
 }
 
@@ -355,18 +325,22 @@ func newTestHandler(t *testing.T, uri lsp.DocumentURI, text string) *Handler {
 }
 
 func TestQMLPropertyInfo(t *testing.T) {
+	// Inject a fake property into the registry so the lookup path is
+	// exercised without relying on qmltypes discovery having run.
+	registerSymbols(QMLSymbol{
+		Label:    "fakePropInfoField",
+		Kind:     lsp.CompletionItemKindProperty,
+		Detail:   "real — Some synthetic property",
+		Category: "property",
+	})
+
 	tests := []struct {
 		name     string
 		propName string
 		wantOK   bool
 		wantType string
 	}{
-		{"width", "width", true, "real"},
-		{"color", "color", true, "color"},
-		{"text", "text", true, "string"},
-		{"visible", "visible", true, "bool"},
-		{"id", "id", true, "string"},
-		{"onClicked", "onClicked", true, "signal"},
+		{"injected", "fakePropInfoField", true, "real"},
 		{"Unknown", "unknownProp", false, ""},
 		{"Empty", "", false, ""},
 	}
