@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"strings"
 
 	"github.com/odvcencio/gotreesitter"
 	"github.com/owenrumney/go-lsp/lsp"
@@ -42,7 +43,7 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 		items = append(items, importedTypeCompletions(imported)...)
 		items = append(items, h.workspaceCompletions()...)
 	case ContextProperty:
-		if typeItems := h.idMemberCompletions(params.TextDocument.URI, lineText, char); typeItems != nil {
+		if typeItems := h.chainMemberCompletions(params.TextDocument.URI, lineText, char); typeItems != nil {
 			items = append(items, typeItems...)
 		} else {
 			items = append(items, qmlPropertyCompletions()...)
@@ -466,16 +467,18 @@ func qmlPropertyCompletions() []lsp.CompletionItem {
 	return completionItemsByCategory("property", "anchor")
 }
 
-// idMemberCompletions returns type-specific completions when the cursor sits
-// just after an `<id>.` and `<id>` resolves to an id binding in the document.
-// Returns nil when the identifier before `.` isn't a known id, so the caller
-// can fall back to generic property completions.
-func (h *Handler) idMemberCompletions(uri lsp.DocumentURI, lineText string, char int) []lsp.CompletionItem {
+// chainMemberCompletions returns completions for the type reached by
+// walking a dotted identifier chain that ends at the cursor's `.`. The
+// first segment must resolve via the file's id index to a concrete type;
+// each subsequent segment dereferences the previous type's declared
+// property type. Returns nil when the pattern doesn't match a resolvable
+// chain so the caller can fall back to generic property completions.
+func (h *Handler) chainMemberCompletions(uri lsp.DocumentURI, lineText string, char int) []lsp.CompletionItem {
 	if h.parser == nil {
 		return nil
 	}
-	ident := identifierBeforeDot(lineText, char)
-	if ident == "" {
+	chain := identifierChainBeforeDot(lineText, char)
+	if len(chain) == 0 {
 		return nil
 	}
 	tree := h.parser.GetTree(uri)
@@ -491,18 +494,32 @@ func (h *Handler) idMemberCompletions(uri lsp.DocumentURI, lineText string, char
 		return nil
 	}
 	index := buildIDTypeIndex(root, h.parser.Language(), []byte(doc))
-	typeName, found := index[ident]
-	if !found {
+	currentType, resolved := index[chain[0]]
+	if !resolved {
 		return nil
 	}
-	return typePropertyCompletions(typeName)
+	for i, seg := range chain[1:] {
+		isLast := i == len(chain)-2
+		// `anchors` is a group property with a fixed well-known sub-property
+		// set. We don't model it as a real type, so special-case it as the
+		// terminal step.
+		if seg == "anchors" && isLast {
+			return getAnchorCompletions()
+		}
+		next := resolvePropertyType(currentType, seg)
+		if next == "" {
+			return nil
+		}
+		currentType = next
+	}
+	return typePropertyCompletions(currentType)
 }
 
-// identifierBeforeDot returns the identifier immediately preceding the `.`
-// that triggered this completion. Walks backward from `pos`, skipping
-// whitespace, then past a single `.`, then collects the identifier-like run.
-// Returns "" if the pattern doesn't match (e.g. multi-level `foo.bar.`).
-func identifierBeforeDot(text string, pos int) string {
+// identifierChainBeforeDot returns the dot-separated identifier chain
+// immediately preceding the `.` at/before pos. For `  foo.bar.baz.|` it
+// returns ["foo", "bar", "baz"]. Returns nil when there is no `.` before
+// the cursor or the run contains a non-identifier segment.
+func identifierChainBeforeDot(text string, pos int) []string {
 	if pos > len(text) {
 		pos = len(text)
 	}
@@ -511,23 +528,101 @@ func identifierBeforeDot(text string, pos int) string {
 		i--
 	}
 	if i < 0 || text[i] != '.' {
-		return ""
+		return nil
 	}
-	i--
-	end := i + 1
-	for i >= 0 && isIdentChar(text[i]) {
+	var segments []string
+	for i >= 0 && text[i] == '.' {
 		i--
+		end := i + 1
+		for i >= 0 && isIdentChar(text[i]) {
+			i--
+		}
+		start := i + 1
+		if start >= end {
+			return nil
+		}
+		segments = append([]string{text[start:end]}, segments...)
 	}
-	start := i + 1
-	if start >= end {
+	return segments
+}
+
+// resolvePropertyType returns the declared type of `propName` on `typeName`,
+// walking the type's base chain. Returns "" when the property isn't found
+// or its declared type doesn't parse back to a bare type name (e.g. the
+// `group`, `list<T>`, or `enumeration` placeholders used for compound
+// properties).
+func resolvePropertyType(typeName, propName string) string {
+	for _, t := range typeChainList(typeName) {
+		for _, sym := range typeProperties[t] {
+			if sym.Label == propName {
+				if rt := extractPropertyType(sym.Signature); rt != "" && isTypeResolvable(rt) {
+					return rt
+				}
+				return ""
+			}
+		}
+	}
+	// Fall back to the flat registry so universal Item-level props resolve
+	// even if the enclosing type's chain hasn't been populated.
+	if sym, ok := lookupSymbol(propName); ok && (sym.Category == "property" || sym.Category == "anchor") {
+		if rt := extractPropertyType(sym.Signature); rt != "" && isTypeResolvable(rt) {
+			return rt
+		}
+	}
+	return ""
+}
+
+// typeChainList is the ordered variant of typeChainSet used for in-order
+// walks. typeName is always the first entry.
+func typeChainList(typeName string) []string {
+	if typeName == "" {
+		return nil
+	}
+	visited := map[string]bool{}
+	var out []string
+	queue := []string{typeName}
+	for len(queue) > 0 && len(visited) < 32 {
+		t := queue[0]
+		queue = queue[1:]
+		if visited[t] {
+			continue
+		}
+		visited[t] = true
+		out = append(out, t)
+		queue = append(queue, baseTypes[t]...)
+	}
+	return out
+}
+
+// extractPropertyType pulls the type name out of a Signature like
+// `width: real`, `Text.text: string`, or `parent: Item (read-only)`.
+// Returns "" when the signature isn't a property binding shape.
+func extractPropertyType(signature string) string {
+	idx := strings.Index(signature, ": ")
+	if idx < 0 {
 		return ""
 	}
-	// Reject multi-dot chains (e.g. `anchors.fill.`) — this helper only
-	// handles the single-level `<id>.` case.
-	if start > 0 && text[start-1] == '.' {
-		return ""
+	t := strings.TrimSpace(signature[idx+2:])
+	if i := strings.Index(t, " ("); i >= 0 {
+		t = t[:i]
 	}
-	return text[start:end]
+	return t
+}
+
+// isTypeResolvable rejects the common non-chainable placeholders used in
+// property signatures. `group` / `font` / `enumeration` / `signal` identify
+// compound properties or non-objects that can't be looked up in the type
+// registry, and container syntaxes like `list<Item>` aren't a single type
+// the chain walker can descend into.
+func isTypeResolvable(t string) bool {
+	switch t {
+	case "", "group", "enumeration", "signal", "var", "any":
+		return false
+	}
+	if strings.ContainsAny(t, "<>") {
+		return false
+	}
+	return true
 }
 
 func qmlKeywords() []lsp.CompletionItem {

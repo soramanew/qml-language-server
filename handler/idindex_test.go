@@ -33,23 +33,37 @@ func TestBuildIDTypeIndexIgnoresNonIdBindings(t *testing.T) {
 	}
 }
 
-func TestIdentifierBeforeDot(t *testing.T) {
+func TestIdentifierChainBeforeDot(t *testing.T) {
 	cases := []struct {
 		text string
 		pos  int
-		want string
+		want []string
 	}{
-		{"    root.", 9, "root"},
-		{"foo = root.", 11, "root"},
-		{"anchors.fill.", 13, ""}, // multi-dot chain: rejected
-		{"    .", 5, ""},          // nothing before dot
-		{"    root", 8, ""},       // no dot at cursor
+		{"    root.", 9, []string{"root"}},
+		{"foo = root.", 11, []string{"root"}},
+		{"anchors.fill.", 13, []string{"anchors", "fill"}}, // multi-dot chain now supported
+		{"foo = root.header.rect.", 23, []string{"root", "header", "rect"}},
+		{"    .", 5, nil},    // nothing before dot
+		{"    root", 8, nil}, // no dot at cursor
 	}
 	for _, tc := range cases {
-		if got := identifierBeforeDot(tc.text, tc.pos); got != tc.want {
-			t.Errorf("identifierBeforeDot(%q, %d) = %q, want %q", tc.text, tc.pos, got, tc.want)
+		got := identifierChainBeforeDot(tc.text, tc.pos)
+		if !stringSlicesEqual(got, tc.want) {
+			t.Errorf("identifierChainBeforeDot(%q, %d) = %v, want %v", tc.text, tc.pos, got, tc.want)
 		}
 	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestCompletionAfterIdDotReturnsTypeProperties(t *testing.T) {
