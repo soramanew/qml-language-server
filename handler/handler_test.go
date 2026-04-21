@@ -269,10 +269,12 @@ func TestCompletionOffersPropertiesInsideObjectBody(t *testing.T) {
 		wantTypeSpecific []string
 	}{
 		{
-			name:             "blank line inside Window",
-			doc:              "import QtQuick\n\nWindow {\n    \n}\n",
-			position:         lsp.Position{Line: 3, Character: 4},
-			wantGeneric:      []string{"width", "height", "anchors"},
+			name: "blank line inside Window",
+			doc:  "import QtQuick\n\nWindow {\n    \n}\n",
+			position: lsp.Position{Line: 3, Character: 4},
+			// Window has its own x/y/width/height/visible/opacity but is NOT
+			// an Item — `anchors` doesn't apply.
+			wantGeneric:      []string{"width", "height"},
 			wantTypeSpecific: []string{"title", "flags", "visibility"},
 		},
 		{

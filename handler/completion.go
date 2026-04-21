@@ -243,12 +243,37 @@ func objectBodyCompletions(enclosingType string, imported map[string]struct{}) [
 }
 
 // propertyTypeRestrictions lists, for each property that should only appear
-// on specific types, the types (and their descendants) where it is valid.
-// Properties not listed here are treated as universally applicable (Item-
-// level or truly universal like `id` / `objectName`) and are never filtered.
-// Used by scopedPropertyCompletions when the enclosing type is known — when
-// it isn't, we keep the legacy broad behavior.
+// on specific types, the types (and their descendants via baseTypes) where
+// it is valid. Properties not listed here are treated as truly universal
+// (`id`, `objectName`, attached `Layout.*`) and are never filtered.
+//
+// Item-level properties are also listed so non-Item types (Timer, Component,
+// ListModel, QtObject, State, Transition, animations) stop surfacing them
+// in bodies where they don't belong — baseTypes connects every visual type
+// to Item, so this entry is equivalent to "visible items only".
 var propertyTypeRestrictions = map[string][]string{
+	// Item-level: anything whose chain reaches Item. Window has its own
+	// subset of these (x/y/width/height/visible/opacity), so it's listed
+	// explicitly alongside Item.
+	"x":               {"Item", "Window"},
+	"y":               {"Item", "Window"},
+	"z":               {"Item"},
+	"width":           {"Item", "Window"},
+	"height":          {"Item", "Window"},
+	"visible":         {"Item", "Window"},
+	"enabled":         {"Item"},
+	"opacity":         {"Item", "Window"},
+	"rotation":        {"Item"},
+	"scale":           {"Item"},
+	"transformOrigin": {"Item"},
+	"clip":            {"Item"},
+	"focus":           {"Item"},
+	"activeFocus":     {"Item"},
+	"anchors":         {"Item"},
+	"parent":          {"Item"},
+	"children":        {"Item"},
+
+	// Type-specific
 	"color":        {"Rectangle", "Text", "Label", "Window", "ApplicationWindow"},
 	"text":         {"Text", "Label", "TextField", "TextArea", "TextInput", "TextEdit", "Button", "CheckBox", "RadioButton", "Switch", "TabButton", "ToolButton", "MenuItem"},
 	"font":         {"Text", "Label", "TextField", "TextArea", "TextInput", "TextEdit", "Button", "CheckBox", "RadioButton", "Switch", "TabButton", "ToolButton", "MenuItem", "ComboBox"},
@@ -463,8 +488,12 @@ func qmlImports() []lsp.CompletionItem {
 	return completionItemsByCategory("import")
 }
 
+// qmlPropertyCompletions returns only the flat "property" bucket; anchor
+// sub-properties (fill, centerIn, top, ...) aren't valid at object-body
+// top level (they require an `anchors.` prefix) and are served separately
+// via getAnchorCompletions whenever the user types `anchors.`.
 func qmlPropertyCompletions() []lsp.CompletionItem {
-	return completionItemsByCategory("property", "anchor")
+	return completionItemsByCategory("property")
 }
 
 // chainMemberCompletions returns completions for the type reached by

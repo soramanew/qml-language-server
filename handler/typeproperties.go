@@ -12,23 +12,68 @@ import (
 // inherit through baseTypes (e.g. ApplicationWindow -> Window -> Item).
 var typeProperties = map[string][]QMLSymbol{}
 
-// baseTypes maps a QML type to the chain of bases whose properties also
-// apply. Order is significant only for documentation; duplicates are
-// collapsed by Label in typePropertyCompletions.
+// baseTypes maps a QML type to its direct base(s). typePropertyCompletions
+// and typeChainSet walk this transitively, so every visual built-in is
+// connected to Item (or Flickable / AbstractButton, which themselves chain
+// to Item). Types that aren't Items — Timer, Component, QtObject,
+// ListModel, State, Transition, animations — have no entry and therefore
+// do NOT inherit Item-level properties like `x`, `width`, `anchors`.
+//
+// Completion scoping depends on these chains: a property whose
+// propertyTypeRestrictions entry doesn't overlap a type's full chain will
+// be filtered out of that type's body. qmltypes discovery may overwrite
+// these hand-coded entries with prototype-derived chains where available.
 var baseTypes = map[string][]string{
-	"ApplicationWindow": {"Window"},
-	"Label":             {"Text"},
-	"TextField":         {"TextInput"},
-	"TextArea":          {"TextEdit"},
+	// Visual core (Item descendants)
+	"Rectangle":   {"Item"},
+	"Text":        {"Item"},
+	"Image":       {"Item"},
+	"AnimatedImage": {"Image"},
+	"MouseArea":   {"Item"},
+	"Column":      {"Item"},
+	"Row":         {"Item"},
+	"Grid":        {"Item"},
+	"Flow":        {"Item"},
+	"Flickable":   {"Item"},
+	"Loader":      {"Item"},
+	"Repeater":    {"Item"},
+	"FocusScope":  {"Item"},
+	"TextInput":   {"Item"},
+	"TextEdit":    {"Item"},
+
+	// Controls-side visuals chain via AbstractButton → Item
+	"AbstractButton":    {"Item"},
 	"Button":            {"AbstractButton"},
 	"CheckBox":          {"AbstractButton"},
 	"RadioButton":       {"AbstractButton"},
 	"Switch":            {"AbstractButton"},
 	"TabButton":         {"AbstractButton"},
+	"ToolButton":        {"AbstractButton"},
+	"Label":             {"Text"},
+	"TextField":         {"TextInput"},
+	"TextArea":          {"TextEdit"},
 	"GridView":          {"Flickable"},
 	"ListView":          {"Flickable"},
 	"ScrollView":        {"Flickable"},
 	"SwipeView":         {"Flickable"},
+	"TableView":         {"Flickable"},
+	"ComboBox":          {"Item"},
+	"Slider":            {"Item"},
+	"ProgressBar":       {"Item"},
+	"TabBar":            {"Item"},
+	"Dialog":            {"Item"},
+	"Popup":             {"Item"},
+	"Menu":              {"Popup"},
+	"MenuItem":          {"AbstractButton"},
+
+	// Windows: separate hierarchy — Window is NOT an Item.
+	"ApplicationWindow": {"Window"},
+
+	// Layouts (attached-property container types)
+	"ColumnLayout": {"Item"},
+	"RowLayout":    {"Item"},
+	"GridLayout":   {"Item"},
+	"StackLayout":  {"Item"},
 }
 
 func init() {

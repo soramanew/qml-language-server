@@ -33,6 +33,45 @@ func TestScopedPropertyCompletionsDropsWrongTypeProperties(t *testing.T) {
 	}
 }
 
+func TestScopedPropertyCompletionsHidesItemPropsFromNonItemTypes(t *testing.T) {
+	// Timer is not an Item. Inside a Timer body the user should not see
+	// x/y/width/height/anchors/parent/etc. — those are Item-specific.
+	items := scopedPropertyCompletions("Timer")
+	forbidden := map[string]bool{
+		"x":               true,
+		"y":               true,
+		"width":           true,
+		"height":          true,
+		"anchors":         true,
+		"parent":          true,
+		"children":        true,
+		"rotation":        true,
+		"transformOrigin": true,
+		"focus":           true,
+		"activeFocus":     true,
+		"color":           true,
+	}
+	for _, item := range items {
+		if forbidden[item.Label] {
+			t.Errorf("Item-level property %q should not appear inside Timer body", item.Label)
+		}
+	}
+}
+
+func TestScopedPropertyCompletionsExcludesAnchorSubproperties(t *testing.T) {
+	// Anchor sub-properties like `fill`/`centerIn`/`top` are only valid
+	// under `anchors.` — they must never appear at object-body top level.
+	items := scopedPropertyCompletions("Rectangle")
+	for _, item := range items {
+		switch item.Label {
+		case "fill", "centerIn", "top", "bottom", "left", "right",
+			"horizontalCenter", "verticalCenter", "margins",
+			"topMargin", "bottomMargin", "leftMargin", "rightMargin":
+			t.Errorf("anchor sub-property %q leaked into Rectangle body", item.Label)
+		}
+	}
+}
+
 func TestScopedPropertyCompletionsKeepsMatchingProperties(t *testing.T) {
 	// Text-specific restricted properties should appear for Text.
 	items := scopedPropertyCompletions("Text")
