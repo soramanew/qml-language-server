@@ -25,12 +25,13 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 	lineText := lines[line]
 
 	context := detectCompletionContext(lineText, char)
+	imported := h.importedModules(params.TextDocument.URI)
 	var items []lsp.CompletionItem
 
 	if h.parser != nil {
 		node := h.parser.GetNodeAt(params.TextDocument.URI, pos, []byte(doc))
 		if node != nil {
-			items = append(items, getContextCompletions(node, h.parser.Language(), []byte(doc))...)
+			items = append(items, getContextCompletions(node, h.parser.Language(), []byte(doc), imported)...)
 		}
 	}
 
@@ -38,7 +39,7 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 	case ContextImport:
 		items = append(items, qmlImports()...)
 	case ContextTypeName:
-		items = append(items, getCompletionTypes()...)
+		items = append(items, importedTypeCompletions(imported)...)
 		items = append(items, h.workspaceCompletions()...)
 	case ContextProperty:
 		if typeItems := h.idMemberCompletions(params.TextDocument.URI, lineText, char); typeItems != nil {
@@ -52,7 +53,7 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 		items = append(items, getValueCompletions()...)
 		items = append(items, completionItemsByCategory("js")...)
 	default:
-		items = append(items, getCompletionTypes()...)
+		items = append(items, importedTypeCompletions(imported)...)
 		items = append(items, h.workspaceCompletions()...)
 		items = append(items, qmlKeywords()...)
 		items = append(items, completionItemsByCategory("js")...)
@@ -65,7 +66,7 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 	}, nil
 }
 
-func getContextCompletions(node *gotreesitter.Node, lang *gotreesitter.Language, content []byte) []lsp.CompletionItem {
+func getContextCompletions(node *gotreesitter.Node, lang *gotreesitter.Language, content []byte, imported map[string]struct{}) []lsp.CompletionItem {
 	var items []lsp.CompletionItem
 	nodeType := node.Type(lang)
 
@@ -74,13 +75,13 @@ func getContextCompletions(node *gotreesitter.Node, lang *gotreesitter.Language,
 		items = append(items, qmlImports()...)
 
 	case "ui_object_definition":
-		items = append(items, getCompletionTypes()...)
+		items = append(items, importedTypeCompletions(imported)...)
 
 	case "ui_object_initializer":
 		// Cursor sits on a blank line inside `Foo { ... }`. Both new child
 		// objects and property bindings are valid here, so offer types,
 		// properties, and the property-declaration keywords.
-		items = append(items, objectBodyCompletions(findEnclosingTypeName(node, lang, content))...)
+		items = append(items, objectBodyCompletions(findEnclosingTypeName(node, lang, content), imported)...)
 
 	case "ui_binding":
 		items = append(items, qmlPropertyCompletions()...)
@@ -99,7 +100,7 @@ func getContextCompletions(node *gotreesitter.Node, lang *gotreesitter.Language,
 		if parent != nil {
 			parentType := parent.Type(lang)
 			if parentType == "ui_object_definition" || parentType == "ui_required" || parentType == "ui_property" {
-				items = append(items, getCompletionTypes()...)
+				items = append(items, importedTypeCompletions(imported)...)
 			}
 			// While the user is mid-word inside an object body the partial
 			// identifier shows up under an ERROR (the binding `name:` hasn't
@@ -107,7 +108,7 @@ func getContextCompletions(node *gotreesitter.Node, lang *gotreesitter.Language,
 			// a single ERROR. Confirm we're still inside a body before
 			// offering the same completions as the blank-line case.
 			if (parentType == "ERROR" || parentType == "ui_object_initializer") && isInsideObjectBody(node, lang, content) {
-				items = append(items, objectBodyCompletions(findEnclosingTypeName(node, lang, content))...)
+				items = append(items, objectBodyCompletions(findEnclosingTypeName(node, lang, content), imported)...)
 			}
 		}
 
@@ -230,12 +231,12 @@ func trimLeadingWhitespace(s string) string {
 // to `enclosingType`, type-specific properties for `enclosingType` (when
 // known), child types, and property-declaration keywords (`property`,
 // `readonly property`, `signal`, ...).
-func objectBodyCompletions(enclosingType string) []lsp.CompletionItem {
+func objectBodyCompletions(enclosingType string, imported map[string]struct{}) []lsp.CompletionItem {
 	items := scopedPropertyCompletions(enclosingType)
 	if enclosingType != "" {
 		items = append(items, typePropertyCompletions(enclosingType)...)
 	}
-	items = append(items, getCompletionTypes()...)
+	items = append(items, importedTypeCompletions(imported)...)
 	items = append(items, qmlKeywords()...)
 	return items
 }
