@@ -250,12 +250,25 @@ func addTypeProps(typeName string, specs []propSpec) {
 }
 
 // typePropertyCompletions returns type-specific properties for `typeName`,
-// walking the base-type chain so e.g. ApplicationWindow inherits Window's
-// properties. Duplicates by Label are dropped (closest wins).
+// walking the base-type chain transitively so e.g. ListView inherits from
+// Flickable which inherits from Item. Duplicates by Label are dropped
+// (closest wins). The walk is breadth-first starting at `typeName` and
+// capped at 32 hops to match resolvePrototypeChain's safety bound.
 func typePropertyCompletions(typeName string) []lsp.CompletionItem {
+	if typeName == "" {
+		return nil
+	}
 	seen := map[string]bool{}
+	visited := map[string]bool{}
 	var items []lsp.CompletionItem
-	for _, t := range append([]string{typeName}, baseTypes[typeName]...) {
+	queue := []string{typeName}
+	for len(queue) > 0 && len(visited) < 32 {
+		t := queue[0]
+		queue = queue[1:]
+		if visited[t] {
+			continue
+		}
+		visited[t] = true
 		for _, s := range typeProperties[t] {
 			if seen[s.Label] {
 				continue
@@ -263,6 +276,7 @@ func typePropertyCompletions(typeName string) []lsp.CompletionItem {
 			seen[s.Label] = true
 			items = append(items, s.CompletionItem())
 		}
+		queue = append(queue, baseTypes[t]...)
 	}
 	return items
 }

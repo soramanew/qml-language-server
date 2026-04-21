@@ -226,17 +226,98 @@ func trimLeadingWhitespace(s string) string {
 }
 
 // objectBodyCompletions is the set of items valid directly inside a
-// `Foo { ... }` body: generic properties, type-specific properties for
-// `enclosingType` (when known), child types, and property-declaration
-// keywords (`property`, `readonly property`, `signal`, ...).
+// `Foo { ... }` body: generic properties filtered to what actually applies
+// to `enclosingType`, type-specific properties for `enclosingType` (when
+// known), child types, and property-declaration keywords (`property`,
+// `readonly property`, `signal`, ...).
 func objectBodyCompletions(enclosingType string) []lsp.CompletionItem {
-	items := qmlPropertyCompletions()
+	items := scopedPropertyCompletions(enclosingType)
 	if enclosingType != "" {
 		items = append(items, typePropertyCompletions(enclosingType)...)
 	}
 	items = append(items, getCompletionTypes()...)
 	items = append(items, qmlKeywords()...)
 	return items
+}
+
+// propertyTypeRestrictions lists, for each property that should only appear
+// on specific types, the types (and their descendants) where it is valid.
+// Properties not listed here are treated as universally applicable (Item-
+// level or truly universal like `id` / `objectName`) and are never filtered.
+// Used by scopedPropertyCompletions when the enclosing type is known — when
+// it isn't, we keep the legacy broad behavior.
+var propertyTypeRestrictions = map[string][]string{
+	"color":        {"Rectangle", "Text", "Label", "Window", "ApplicationWindow"},
+	"text":         {"Text", "Label", "TextField", "TextArea", "TextInput", "TextEdit", "Button", "CheckBox", "RadioButton", "Switch", "TabButton", "ToolButton", "MenuItem"},
+	"font":         {"Text", "Label", "TextField", "TextArea", "TextInput", "TextEdit", "Button", "CheckBox", "RadioButton", "Switch", "TabButton", "ToolButton", "MenuItem", "ComboBox"},
+	"radius":       {"Rectangle"},
+	"source":       {"Image", "AnimatedImage", "Loader", "AnimatedSprite"},
+	"model":        {"ListView", "GridView", "Repeater", "TableView", "ComboBox"},
+	"delegate":     {"ListView", "GridView", "Repeater", "TableView", "ComboBox"},
+	"currentIndex": {"ListView", "GridView", "TableView", "ComboBox", "TabBar", "SwipeView", "StackLayout", "StackView"},
+	"count":        {"ListView", "GridView", "Repeater", "TableView", "ComboBox", "TabBar"},
+	"spacing":      {"Column", "Row", "Grid", "Flow", "ColumnLayout", "RowLayout", "GridLayout", "ListView", "GridView"},
+	"onClicked":    {"MouseArea", "AbstractButton", "Button", "TabButton", "ToolButton", "CheckBox", "RadioButton", "Switch", "MenuItem"},
+	"onPressed":    {"MouseArea", "AbstractButton", "Button"},
+	"onReleased":   {"MouseArea", "AbstractButton", "Button"},
+	"onEntered":    {"MouseArea"},
+	"onExited":     {"MouseArea"},
+	"onTriggered":  {"Timer", "Action", "MenuItem"},
+}
+
+// scopedPropertyCompletions is qmlPropertyCompletions filtered to items that
+// actually apply to enclosingType. Items with no entry in
+// propertyTypeRestrictions are always kept; listed items survive only if
+// enclosingType — or any of its transitive bases — is in the allowlist.
+// An empty enclosingType disables filtering.
+func scopedPropertyCompletions(enclosingType string) []lsp.CompletionItem {
+	items := qmlPropertyCompletions()
+	if enclosingType == "" {
+		return items
+	}
+	chain := typeChainSet(enclosingType)
+	out := make([]lsp.CompletionItem, 0, len(items))
+	for _, item := range items {
+		allowed, restricted := propertyTypeRestrictions[item.Label]
+		if !restricted {
+			out = append(out, item)
+			continue
+		}
+		if anyInChain(chain, allowed) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// typeChainSet returns the set containing t and every ancestor reachable via
+// repeated baseTypes lookups. A max depth guards against pathological cycles
+// introduced by qmltypes prototype chains; 32 matches resolvePrototypeChain.
+func typeChainSet(t string) map[string]struct{} {
+	set := map[string]struct{}{}
+	if t == "" {
+		return set
+	}
+	queue := []string{t}
+	for len(queue) > 0 && len(set) < 32 {
+		cur := queue[0]
+		queue = queue[1:]
+		if _, seen := set[cur]; seen {
+			continue
+		}
+		set[cur] = struct{}{}
+		queue = append(queue, baseTypes[cur]...)
+	}
+	return set
+}
+
+func anyInChain(chain map[string]struct{}, candidates []string) bool {
+	for _, c := range candidates {
+		if _, ok := chain[c]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // isInsideObjectBody returns true if `node` sits inside a `Foo { ... }`
