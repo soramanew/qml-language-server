@@ -133,6 +133,76 @@ func TestChainCompletionTerminalAnchorsOffersAnchors(t *testing.T) {
 	}
 }
 
+// TestChainCompletionUsesUserDeclaredProperties verifies that walking a
+// chain through a `property Item target: ...` declaration resolves to the
+// target type even when the declared type isn't touched by qmltypes
+// discovery (the user might have any arbitrary type there).
+func TestChainCompletionUsesUserDeclaredProperties(t *testing.T) {
+	typeProperties["UDPHost"] = []QMLSymbol{}
+	typeProperties["UDPTarget"] = []QMLSymbol{
+		{Label: "nested", Signature: "UDPTarget.nested: real", Category: "property"},
+	}
+	defer delete(typeProperties, "UDPHost")
+	defer delete(typeProperties, "UDPTarget")
+
+	// User declares `property UDPTarget target:` on a UDPHost — this is the
+	// kind of hookup that only exists in the user's file.
+	doc := "import X\n\nUDPHost {\n    id: host\n    property UDPTarget target: null\n    Component.onCompleted: host.target.\n}\n"
+	uri := lsp.DocumentURI("test://udp.qml")
+	h := newTestHandler(t, uri, doc)
+
+	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+			TextDocument: lsp.TextDocumentIdentifier{URI: uri},
+			Position:     lsp.Position{Line: 5, Character: 39},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	for _, item := range list.Items {
+		if item.Label == "nested" {
+			return
+		}
+	}
+	t.Errorf("expected `nested` from UDPTarget after host.target. ; got %d items", len(list.Items))
+}
+
+// TestChainCompletionTerminalMergesUserProperties verifies that `id.` (a
+// single-hop chain) offers both Qt-registered and user-declared properties
+// of the object the id refers to.
+func TestChainCompletionTerminalMergesUserProperties(t *testing.T) {
+	typeProperties["MergeHost"] = []QMLSymbol{
+		{Label: "qtProp", Signature: "MergeHost.qtProp: real", Category: "property"},
+	}
+	defer delete(typeProperties, "MergeHost")
+
+	doc := "import X\n\nMergeHost {\n    id: h\n    property int userProp: 0\n    Component.onCompleted: h.\n}\n"
+	uri := lsp.DocumentURI("test://merge.qml")
+	h := newTestHandler(t, uri, doc)
+
+	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+			TextDocument: lsp.TextDocumentIdentifier{URI: uri},
+			Position:     lsp.Position{Line: 5, Character: 29},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	want := map[string]bool{"qtProp": false, "userProp": false}
+	for _, item := range list.Items {
+		if _, ok := want[item.Label]; ok {
+			want[item.Label] = true
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("expected %q in completions after h.", name)
+		}
+	}
+}
+
 func TestChainCompletionBrokenChainFallsBack(t *testing.T) {
 	// When the chain can't be resolved (group-typed intermediate), the
 	// completion path falls back to qmlPropertyCompletions. Seed a

@@ -402,8 +402,11 @@ func qmlPropertyCompletions() []lsp.CompletionItem {
 // walking a dotted identifier chain that ends at the cursor's `.`. The
 // first segment must resolve via the file's id index to a concrete type;
 // each subsequent segment dereferences the previous type's declared
-// property type. Returns nil when the pattern doesn't match a resolvable
-// chain so the caller can fall back to generic property completions.
+// property type. User-declared properties on the first segment's object
+// (`property Item target: ...`) also participate so that `root.target.`
+// can chain through types that aren't in any qmltypes file. Returns nil
+// when the pattern doesn't match a resolvable chain so the caller can
+// fall back to generic property completions.
 func (h *Handler) chainMemberCompletions(uri lsp.DocumentURI, lineText string, char int) []lsp.CompletionItem {
 	if h.parser == nil {
 		return nil
@@ -424,11 +427,16 @@ func (h *Handler) chainMemberCompletions(uri lsp.DocumentURI, lineText string, c
 	if !ok {
 		return nil
 	}
-	index := buildIDTypeIndex(root, h.parser.Language(), []byte(doc))
-	currentType, resolved := index[chain[0]]
+	scopes := buildIDScopeIndex(root, h.parser.Language(), []byte(doc))
+	scope, resolved := scopes[chain[0]]
 	if !resolved {
 		return nil
 	}
+	currentType := scope.TypeName
+	// userProps is non-nil only while we're still referring to the object
+	// whose id started the chain. Once we hop through a property, subsequent
+	// segments resolve purely through the (global) type registry.
+	userProps := scope.UserProps
 	for i, seg := range chain[1:] {
 		isLast := i == len(chain)-2
 		// `anchors` is a group property with a fixed well-known sub-property
@@ -437,13 +445,52 @@ func (h *Handler) chainMemberCompletions(uri lsp.DocumentURI, lineText string, c
 		if seg == "anchors" && isLast {
 			return getAnchorCompletions()
 		}
-		next := resolvePropertyType(currentType, seg)
+		var next string
+		if ut, ok := userProps[seg]; ok {
+			if !isTypeResolvable(ut) {
+				return nil
+			}
+			next = ut
+		} else {
+			next = resolvePropertyType(currentType, seg)
+		}
 		if next == "" {
 			return nil
 		}
 		currentType = next
+		userProps = nil
 	}
-	return typePropertyCompletions(currentType)
+	items := typePropertyCompletions(currentType)
+	items = append(items, userPropertyCompletions(userProps)...)
+	if len(items) == 0 {
+		// Primitive or unknown terminal type — let the caller fall back to
+		// generic property completions instead of silently offering nothing.
+		return nil
+	}
+	return items
+}
+
+// userPropertyCompletions turns a user-declared property map
+// (name → declared type) into CompletionItems. Returns nil when the map is
+// empty so callers can append without branching.
+func userPropertyCompletions(props map[string]string) []lsp.CompletionItem {
+	if len(props) == 0 {
+		return nil
+	}
+	kind := lsp.CompletionItemKindProperty
+	items := make([]lsp.CompletionItem, 0, len(props))
+	for name, declType := range props {
+		items = append(items, lsp.CompletionItem{
+			Label:  name,
+			Kind:   &kind,
+			Detail: declType + " — " + name + " (declared in file)",
+			Documentation: &lsp.MarkupContent{
+				Kind:  lsp.Markdown,
+				Value: "**" + name + "** — user-declared property\n\n```qml\nproperty " + declType + " " + name + "\n```",
+			},
+		})
+	}
+	return items
 }
 
 // identifierChainBeforeDot returns the dot-separated identifier chain
