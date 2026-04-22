@@ -2,96 +2,21 @@ package handler
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/owenrumney/go-lsp/lsp"
 )
 
-func TestFormattingReindentsBracedBlocks(t *testing.T) {
-	in := "import QtQuick\nRectangle {\nwidth: 100\nText {\ntext: \"hi\"\n}\n}\n"
-	want := "import QtQuick\nRectangle {\n    width: 100\n    Text {\n        text: \"hi\"\n    }\n}\n"
-
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-	if got != want {
-		t.Errorf("formatQML mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+// TestFormattingReturnsEmptyWithoutQmlformat verifies the handler returns
+// an empty edit list (not nil, not an error) when qmlformat isn't on the
+// system. The test harness doesn't install it on this path, so h.qmlformat
+// is whatever newQmlformatRunner detects at construction time; if
+// qmlformat *is* present we skip the assertion.
+func TestFormattingReturnsEmptyWithoutQmlformat(t *testing.T) {
+	h := newTestHandler(t, "test://fmt.qml", "Rectangle {\nwidth: 100\n}\n")
+	if h.qmlformat != nil {
+		t.Skip("qmlformat is installed; covered by integration")
 	}
-}
-
-func TestFormattingTrimsTrailingWhitespace(t *testing.T) {
-	in := "Rectangle {   \n    width: 100   \n}   \n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
-		if strings.HasSuffix(line, " ") || strings.HasSuffix(line, "\t") {
-			t.Errorf("trailing whitespace on line %q", line)
-		}
-	}
-}
-
-func TestFormattingCollapsesBlankRuns(t *testing.T) {
-	in := "Rectangle {\n\n\n\n    width: 100\n\n\n}\n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-	// Allow at most one blank line between content lines.
-	saw := 0
-	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
-		if line == "" {
-			saw++
-			if saw > 1 {
-				t.Errorf("found a run of more than one blank line in:\n%s", got)
-			}
-		} else {
-			saw = 0
-		}
-	}
-}
-
-func TestFormattingHonoursTabsOption(t *testing.T) {
-	in := "Rectangle {\nwidth: 100\n}\n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: false})
-	if !strings.Contains(got, "\twidth: 100") {
-		t.Errorf("expected tab-indented body, got:\n%s", got)
-	}
-}
-
-func TestFormattingIgnoresBracesInsideStringsAndComments(t *testing.T) {
-	in := "Rectangle {\ntext: \"a } b\"\n// comment with }\n/* block } closed */\nwidth: 100\n}\n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-
-	// All four interior lines should be indented exactly one level (4 spaces).
-	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n")[1:5] {
-		if !strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "        ") {
-			t.Errorf("line %q expected single-level indent", line)
-		}
-	}
-}
-
-func TestFormattingPreservesSemanticContent(t *testing.T) {
-	in := "Rectangle {\nwidth: 100\ntext: \"hello world\"\n}\n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-
-	// Check that every non-whitespace token in the input survives.
-	for _, want := range []string{"Rectangle", "width: 100", "text: \"hello world\""} {
-		if !strings.Contains(got, want) {
-			t.Errorf("output is missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestFormattingEnsuresFinalNewline(t *testing.T) {
-	in := "Rectangle {\n    width: 100\n}"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-	if !strings.HasSuffix(got, "\n") {
-		t.Errorf("output missing trailing newline: %q", got)
-	}
-	if strings.HasSuffix(got, "\n\n") {
-		t.Errorf("output has extra trailing newline: %q", got)
-	}
-}
-
-func TestFormattingNoChangeReturnsEmptyEdits(t *testing.T) {
-	doc := "import QtQuick\n\nRectangle {\n    width: 100\n}\n"
-	h := newTestHandler(t, "test://fmt.qml", doc)
-
 	edits, err := h.Formatting(context.Background(), &lsp.DocumentFormattingParams{
 		TextDocument: lsp.TextDocumentIdentifier{URI: "test://fmt.qml"},
 		Options:      lsp.FormattingOptions{TabSize: 4, InsertSpaces: true},
@@ -99,45 +24,53 @@ func TestFormattingNoChangeReturnsEmptyEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Formatting: %v", err)
 	}
-	if len(edits) != 0 {
-		t.Errorf("already-formatted doc should produce no edits, got %d", len(edits))
+	if edits == nil || len(edits) != 0 {
+		t.Errorf("expected empty edits when qmlformat missing, got %+v", edits)
 	}
 }
 
-func TestFormattingHandlerReturnsPerLineEdits(t *testing.T) {
-	doc := "import QtQuick\nRectangle {\nwidth: 100\n}\n"
-	h := newTestHandler(t, "test://fmt2.qml", doc)
-
+// TestFormattingRunsQmlformatWhenAvailable exercises the full path when
+// qmlformat is installed — the handler should return a single
+// whole-document TextEdit whose NewText matches qmlformat's output.
+func TestFormattingRunsQmlformatWhenAvailable(t *testing.T) {
+	h := newTestHandler(t, "test://fmt.qml", "Rectangle {\nwidth: 100\n}\n")
+	if h.qmlformat == nil {
+		t.Skip("qmlformat not installed")
+	}
 	edits, err := h.Formatting(context.Background(), &lsp.DocumentFormattingParams{
-		TextDocument: lsp.TextDocumentIdentifier{URI: "test://fmt2.qml"},
+		TextDocument: lsp.TextDocumentIdentifier{URI: "test://fmt.qml"},
 		Options:      lsp.FormattingOptions{TabSize: 4, InsertSpaces: true},
 	})
 	if err != nil {
 		t.Fatalf("Formatting: %v", err)
 	}
 	if len(edits) != 1 {
-		t.Fatalf("expected a single per-line edit, got %d", len(edits))
+		t.Fatalf("expected one whole-document edit, got %d", len(edits))
 	}
-	got := edits[0]
-	wantRange := lsp.Range{
-		Start: lsp.Position{Line: 2, Character: 0},
-		End:   lsp.Position{Line: 2, Character: 10},
+	if edits[0].NewText == "" {
+		t.Error("expected non-empty formatted text")
 	}
-	if got.Range != wantRange {
-		t.Errorf("edit range = %+v, want %+v", got.Range, wantRange)
-	}
-	if got.NewText != "    width: 100" {
-		t.Errorf("edit NewText = %q, want %q", got.NewText, "    width: 100")
+	if edits[0].Range.Start.Line != 0 || edits[0].Range.Start.Character != 0 {
+		t.Errorf("edit must start at (0,0), got %+v", edits[0].Range.Start)
 	}
 }
 
-func TestFormattingIndentsSquareBracketContents(t *testing.T) {
-	in := "Item {\nstates: [\nState { name: \"a\" }\n]\n}\n"
-	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
-	if !strings.Contains(got, "\n        State { name: \"a\" }\n") {
-		t.Errorf("expected State inside states[] at 8-space indent:\n%s", got)
+func TestWholeDocumentRangeCountsLinesAndLastLine(t *testing.T) {
+	cases := []struct {
+		doc         string
+		wantLine    int
+		wantCharEnd int
+	}{
+		{"", 0, 0},
+		{"A", 0, 1},
+		{"A\n", 1, 0},
+		{"A\nB", 1, 1},
+		{"A\nB\n", 2, 0},
 	}
-	if !strings.Contains(got, "\n    ]\n") {
-		t.Errorf("expected closing `]` at 4-space indent:\n%s", got)
+	for _, tc := range cases {
+		got := wholeDocumentRange(tc.doc)
+		if got.End.Line != tc.wantLine || got.End.Character != tc.wantCharEnd {
+			t.Errorf("doc=%q end=%+v, want {%d,%d}", tc.doc, got.End, tc.wantLine, tc.wantCharEnd)
+		}
 	}
 }

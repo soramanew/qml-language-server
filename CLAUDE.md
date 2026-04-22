@@ -53,6 +53,9 @@ Tree-sitter-derived diagnostics are disabled (`collectDiagnostics` is a no-op); 
 ### Completion
 Completion is delegated wholesale to Qt's `qmlls`. We never generate completion items in-process — no keyword lists, no property catalogs, no id-scope walking. Adding anything to `completion.go` beyond "ask qmlls" is a regression.
 
+### Formatting
+Formatting is delegated to Qt's `qmlformat` via `handler/qmlformat.go`. Each request writes the current document to a temp file, runs qmlformat, and returns the stdout as a single whole-document TextEdit. When the binary isn't on the system the capability is omitted from Initialize and the handler returns no edits. Do not add an in-process formatter — qmlformat is the source of truth.
+
 ## Notes for editing
 
 - When adding a new LSP method, update both `Handler.Initialize`'s capabilities and add the method on `Handler`.

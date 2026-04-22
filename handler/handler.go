@@ -29,8 +29,9 @@ type Handler struct {
 	server    *server.Server
 	workspace *workspaceIndex
 
-	qmllint *qmllintRunner
-	qmlls   *qmllsClient
+	qmllint   *qmllintRunner
+	qmlls     *qmllsClient
+	qmlformat *qmlformatRunner
 
 	lintMu      sync.Mutex
 	lintCancels map[lsp.DocumentURI]context.CancelFunc
@@ -47,6 +48,7 @@ func New(logger *slog.Logger) *Handler {
 		parser:      parser,
 		workspace:   newWorkspaceIndex(),
 		qmllint:     newQmllintRunner(logger),
+		qmlformat:   newQmlformatRunner(logger),
 		lintCancels: make(map[lsp.DocumentURI]context.CancelFunc),
 	}
 }
@@ -134,8 +136,8 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 			},
 			FoldingRangeProvider:            boolPtr(true),
 			WorkspaceSymbolProvider:         boolPtr(true),
-			DocumentFormattingProvider:      boolPtr(true),
-			DocumentRangeFormattingProvider: boolPtr(true),
+			DocumentFormattingProvider:      boolPtrIf(h.qmlformat != nil),
+			DocumentRangeFormattingProvider: boolPtrIf(h.qmlformat != nil),
 			DocumentLinkProvider:            &lsp.DocumentLinkOptions{},
 		},
 		ServerInfo: &lsp.ServerInfo{
@@ -355,3 +357,13 @@ func (h *Handler) getDiagnostics(uri lsp.DocumentURI) []lsp.Diagnostic {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// boolPtrIf returns a *bool pointing to true when b is true, and nil
+// otherwise. Used for capability fields where omitting the field
+// altogether tells the client "feature not available".
+func boolPtrIf(b bool) *bool {
+	if !b {
+		return nil
+	}
+	return boolPtr(true)
+}
