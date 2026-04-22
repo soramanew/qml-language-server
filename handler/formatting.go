@@ -12,7 +12,10 @@ import (
 // lines to at most one, and ensures the file ends with a single newline.
 // The whole pass is whitespace-only — token content is never modified — so
 // even a syntactically broken document gets back something valid for the
-// non-broken parts.
+// non-broken parts. Emits one TextEdit per differing line instead of a
+// whole-file replacement: some LSP clients jump the cursor back to
+// position (0, 0) or lose selection state on a full-document edit, and
+// per-line edits keep the user's cursor anchored.
 func (h *Handler) Formatting(_ context.Context, params *lsp.DocumentFormattingParams) ([]lsp.TextEdit, error) {
 	doc, ok := h.getDocument(params.TextDocument.URI)
 	if !ok {
@@ -23,14 +26,70 @@ func (h *Handler) Formatting(_ context.Context, params *lsp.DocumentFormattingPa
 	if formatted == doc {
 		return []lsp.TextEdit{}, nil
 	}
-	content := []byte(doc)
-	return []lsp.TextEdit{{
-		Range: lsp.Range{
-			Start: lsp.Position{Line: 0, Character: 0},
-			End:   byteOffsetToPosition(content, uint32(len(content))),
-		},
-		NewText: formatted,
-	}}, nil
+	return perLineEdits(doc, formatted), nil
+}
+
+// perLineEdits produces an LSP TextEdit for each line where `original`
+// and `formatted` differ. When the line counts disagree (blank-run
+// collapse, trailing-newline insertion) we fall back to one
+// whole-document replace for the tail so everything is still covered.
+func perLineEdits(original, formatted string) []lsp.TextEdit {
+	origLines := splitLinesKeepEmpty(original)
+	newLines := splitLinesKeepEmpty(formatted)
+
+	var edits []lsp.TextEdit
+	common := len(origLines)
+	if len(newLines) < common {
+		common = len(newLines)
+	}
+	for i := 0; i < common; i++ {
+		if origLines[i] == newLines[i] {
+			continue
+		}
+		edits = append(edits, lsp.TextEdit{
+			Range: lsp.Range{
+				Start: lsp.Position{Line: i, Character: 0},
+				End:   lsp.Position{Line: i, Character: len(origLines[i])},
+			},
+			NewText: newLines[i],
+		})
+	}
+
+	// Handle shape changes (added/removed lines) as one tail edit so we
+	// don't have to fight the LSP line-delta math.
+	if len(origLines) != len(newLines) {
+		tailStart := common
+		end := lsp.Position{
+			Line:      len(origLines) - 1,
+			Character: len(origLines[len(origLines)-1]),
+		}
+		if tailStart >= len(origLines) {
+			// Pure append.
+			edits = append(edits, lsp.TextEdit{
+				Range:   lsp.Range{Start: end, End: end},
+				NewText: strings.Join(newLines[tailStart:], "\n"),
+			})
+		} else {
+			edits = append(edits, lsp.TextEdit{
+				Range: lsp.Range{
+					Start: lsp.Position{Line: tailStart, Character: 0},
+					End:   end,
+				},
+				NewText: strings.Join(newLines[tailStart:], "\n"),
+			})
+		}
+	}
+	return edits
+}
+
+// splitLinesKeepEmpty is strings.Split(s, "\n") but guarantees at least
+// one entry for the empty string (so `perLineEdits` can always index
+// `[len-1]`).
+func splitLinesKeepEmpty(s string) []string {
+	if s == "" {
+		return []string{""}
+	}
+	return strings.Split(s, "\n")
 }
 
 func (h *Handler) RangeFormatting(_ context.Context, params *lsp.DocumentRangeFormattingParams) ([]lsp.TextEdit, error) {
@@ -140,13 +199,14 @@ func indentUnitFrom(opts lsp.FormattingOptions) string {
 	return strings.Repeat(" ", size)
 }
 
-// countLeadingClose returns how many `}` or `)` characters lead this trimmed
-// line. Used so that closing braces render at the parent's indentation level.
+// countLeadingClose returns how many `}`, `)`, or `]` characters lead
+// this trimmed line. Used so that closing brackets render at the parent's
+// indentation level.
 func countLeadingClose(s string) int {
 	count := 0
 	for _, r := range s {
 		switch r {
-		case '}', ')':
+		case '}', ')', ']':
 			count++
 		default:
 			return count
@@ -207,9 +267,9 @@ func scanLineForBraces(line string, st *scanState, depth int) int {
 			}
 		case '"', '\'', '`':
 			st.inString = c
-		case '{', '(':
+		case '{', '(', '[':
 			depth++
-		case '}', ')':
+		case '}', ')', ']':
 			depth--
 		}
 	}

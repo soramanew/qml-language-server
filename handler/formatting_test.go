@@ -104,7 +104,7 @@ func TestFormattingNoChangeReturnsEmptyEdits(t *testing.T) {
 	}
 }
 
-func TestFormattingHandlerReturnsFullReplacement(t *testing.T) {
+func TestFormattingHandlerReturnsPerLineEdits(t *testing.T) {
 	doc := "import QtQuick\nRectangle {\nwidth: 100\n}\n"
 	h := newTestHandler(t, "test://fmt2.qml", doc)
 
@@ -116,9 +116,28 @@ func TestFormattingHandlerReturnsFullReplacement(t *testing.T) {
 		t.Fatalf("Formatting: %v", err)
 	}
 	if len(edits) != 1 {
-		t.Fatalf("expected exactly one edit (full replacement), got %d", len(edits))
+		t.Fatalf("expected a single per-line edit, got %d", len(edits))
 	}
-	if !strings.Contains(edits[0].NewText, "    width: 100") {
-		t.Errorf("expected width to be indented; got:\n%s", edits[0].NewText)
+	got := edits[0]
+	wantRange := lsp.Range{
+		Start: lsp.Position{Line: 2, Character: 0},
+		End:   lsp.Position{Line: 2, Character: 10},
+	}
+	if got.Range != wantRange {
+		t.Errorf("edit range = %+v, want %+v", got.Range, wantRange)
+	}
+	if got.NewText != "    width: 100" {
+		t.Errorf("edit NewText = %q, want %q", got.NewText, "    width: 100")
+	}
+}
+
+func TestFormattingIndentsSquareBracketContents(t *testing.T) {
+	in := "Item {\nstates: [\nState { name: \"a\" }\n]\n}\n"
+	got := formatQML(in, lsp.FormattingOptions{TabSize: 4, InsertSpaces: true})
+	if !strings.Contains(got, "\n        State { name: \"a\" }\n") {
+		t.Errorf("expected State inside states[] at 8-space indent:\n%s", got)
+	}
+	if !strings.Contains(got, "\n    ]\n") {
+		t.Errorf("expected closing `]` at 4-space indent:\n%s", got)
 	}
 }
