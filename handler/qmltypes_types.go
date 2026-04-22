@@ -64,9 +64,11 @@ type QMLTypesSignal struct {
 }
 
 type QMLTypesMethod struct {
-	Name       string
-	ReturnType string
-	Parameters []QMLTypesParameter
+	Name          string
+	ReturnType    string
+	Parameters    []QMLTypesParameter
+	IsConstructor bool
+	IsCloned      bool
 }
 
 type QMLTypesParameter struct {

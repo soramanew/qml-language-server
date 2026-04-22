@@ -316,6 +316,9 @@ func registerQMLTypesModule(mod *QMLTypesModule, fallbackModule string) {
 // enums from a parsed component as type-specific completions.
 func registerQMLTypesProperties(comp *QMLTypesComponent, qmlName string) {
 	for _, prop := range comp.Properties {
+		if isInternalName(prop.Name) {
+			continue
+		}
 		label := prop.Name
 		qmlType := cppTypeToQML(prop.Type)
 		detail := qmlType + " — " + label + " (" + qmlName + ")"
@@ -333,6 +336,9 @@ func registerQMLTypesProperties(comp *QMLTypesComponent, qmlName string) {
 	}
 
 	for _, sig := range comp.Signals {
+		if isInternalName(sig.Name) {
+			continue
+		}
 		handlerName := "on" + capitalize(sig.Name)
 		detail := "signal — " + sig.Name + " (" + qmlName + ")"
 		sym := QMLSymbol{
@@ -348,7 +354,7 @@ func registerQMLTypesProperties(comp *QMLTypesComponent, qmlName string) {
 	}
 
 	for _, m := range comp.Methods {
-		if m.Name == "" {
+		if m.Name == "" || m.IsConstructor || m.IsCloned || isInternalName(m.Name) {
 			continue
 		}
 		detail := "method — " + m.Name + " (" + qmlName + ")"
@@ -392,7 +398,7 @@ func registerQMLTypesProperties(comp *QMLTypesComponent, qmlName string) {
 // keys. Existing hand-coded entries are never overwritten.
 func registerQMLTypesSignatures(comp *QMLTypesComponent, qmlName string) {
 	for _, m := range comp.Methods {
-		if m.Name == "" {
+		if m.Name == "" || m.IsConstructor || m.IsCloned || isInternalName(m.Name) {
 			continue
 		}
 		sig := buildSignatureInfo(m)
@@ -432,6 +438,15 @@ func buildSignatureInfo(m QMLTypesMethod) lsp.SignatureInformation {
 		Label:      sigLabel,
 		Parameters: params,
 	}
+}
+
+// isInternalName reports whether a property/signal/method name is a Qt
+// implementation detail that should never surface in user-facing completions.
+// Qt's qmltypes files expose private C++ glue (`_q_createJSWrapper`,
+// `_q_resourceObjectDeleted`, `_q_reregisterTimers`, ...) and the `_` prefix
+// is the universal Qt/C++ convention for "not API".
+func isInternalName(name string) bool {
+	return strings.HasPrefix(name, "_")
 }
 
 // addTypeProperty adds a property to the per-type catalog (typeProperties map)

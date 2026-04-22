@@ -229,6 +229,10 @@ func (p *qmltypesParser) parseMethod() QMLTypesMethod {
 				m.Name = p.readString()
 			case "type":
 				m.ReturnType = p.readString()
+			case "isConstructor":
+				m.IsConstructor = p.readBool()
+			case "isCloned":
+				m.IsCloned = p.readBool()
 			default:
 				p.skipValue()
 			}

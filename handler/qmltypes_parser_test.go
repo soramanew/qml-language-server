@@ -137,6 +137,34 @@ func TestParseQMLTypesMethods(t *testing.T) {
 	}
 }
 
+func TestParseQMLTypesMethodFlags(t *testing.T) {
+	src := `Module {
+    Component {
+        name: "Foo"
+        Method { name: "Foo"; isConstructor: true }
+        Method { name: "destroy"; isCloned: true }
+        Method { name: "update" }
+    }
+}`
+	mod, err := ParseQMLTypes(src)
+	if err != nil {
+		t.Fatalf("ParseQMLTypes: %v", err)
+	}
+	methods := mod.Components[0].Methods
+	if len(methods) != 3 {
+		t.Fatalf("expected 3 methods, got %d", len(methods))
+	}
+	if !methods[0].IsConstructor || methods[0].IsCloned {
+		t.Errorf("methods[0] flags = {ctor=%v, cloned=%v}, want {true, false}", methods[0].IsConstructor, methods[0].IsCloned)
+	}
+	if methods[1].IsConstructor || !methods[1].IsCloned {
+		t.Errorf("methods[1] flags = {ctor=%v, cloned=%v}, want {false, true}", methods[1].IsConstructor, methods[1].IsCloned)
+	}
+	if methods[2].IsConstructor || methods[2].IsCloned {
+		t.Errorf("methods[2] flags = {ctor=%v, cloned=%v}, want {false, false}", methods[2].IsConstructor, methods[2].IsCloned)
+	}
+}
+
 func TestParseQMLTypesEnums(t *testing.T) {
 	mod, _ := ParseQMLTypes(testQMLTypes)
 	rect := mod.Components[0]
