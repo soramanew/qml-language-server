@@ -9,6 +9,7 @@ import (
 	"sync"
 	"unicode"
 
+	"github.com/odvcencio/gotreesitter"
 	"github.com/owenrumney/go-lsp/lsp"
 )
 
@@ -84,6 +85,105 @@ func (w *workspaceIndex) scan() {
 	w.mu.Unlock()
 	for _, c := range found {
 		publishWorkspaceSymbol(c)
+		indexWorkspaceComponentSignature(c)
+	}
+}
+
+// indexWorkspaceComponentSignature parses a workspace QML file and
+// registers the top-level component's declared properties and base type
+// into typeProperties/baseTypes, so completion on `MyWidget { ... }`
+// bodies and chains through a `property MyWidget foo` resolve just like
+// Qt-provided types. Silently bails on parse errors — missing signatures
+// only lose completion, never crash the server.
+func indexWorkspaceComponentSignature(c workspaceComponent) {
+	data, err := os.ReadFile(c.Path)
+	if err != nil {
+		return
+	}
+	p := NewQMLParser()
+	if p == nil {
+		return
+	}
+	tree, err := p.parser.Parse(data)
+	if err != nil || tree == nil {
+		return
+	}
+	root := tree.RootNode()
+	if root == nil {
+		return
+	}
+	topObject := findTopLevelObjectDefinition(root, p.Language())
+	if topObject == nil {
+		return
+	}
+	base := objectDefinitionTypeName(topObject, p.Language(), data)
+	if base != "" && base != c.Name {
+		setTypeBase(c.Name, []string{base})
+	}
+	for _, prop := range collectObjectDeclaredProperties(topObject, p.Language(), data) {
+		addTypeProperty(c.Name, workspaceDeclaredPropertySymbol(c.Name, prop))
+	}
+}
+
+// findTopLevelObjectDefinition returns the first `ui_object_definition`
+// directly under the root — the top-level object that gives the file its
+// component shape.
+func findTopLevelObjectDefinition(root *gotreesitter.Node, lang *gotreesitter.Language) *gotreesitter.Node {
+	for i := 0; i < root.ChildCount(); i++ {
+		c := root.Child(i)
+		if c != nil && c.Type(lang) == "ui_object_definition" {
+			return c
+		}
+	}
+	return nil
+}
+
+// declaredProperty captures one `property <type> <name>` declaration.
+type declaredProperty struct {
+	Name string
+	Type string
+}
+
+// collectObjectDeclaredProperties scans the direct `ui_property` children
+// of an object for their declared (name, type) pairs.
+func collectObjectDeclaredProperties(obj *gotreesitter.Node, lang *gotreesitter.Language, content []byte) []declaredProperty {
+	var init *gotreesitter.Node
+	for i := 0; i < obj.ChildCount(); i++ {
+		c := obj.Child(i)
+		if c != nil && c.Type(lang) == "ui_object_initializer" {
+			init = c
+			break
+		}
+	}
+	if init == nil {
+		return nil
+	}
+	var out []declaredProperty
+	for i := 0; i < init.ChildCount(); i++ {
+		child := init.Child(i)
+		if child == nil || child.Type(lang) != "ui_property" {
+			continue
+		}
+		name, declType := parseUserProperty(child, lang, content)
+		if name == "" || declType == "" {
+			continue
+		}
+		out = append(out, declaredProperty{Name: name, Type: declType})
+	}
+	return out
+}
+
+// workspaceDeclaredPropertySymbol builds a QMLSymbol that looks like the
+// ones qmltypes discovery emits, so chain walking and completion treat
+// user-declared properties uniformly with Qt's own.
+func workspaceDeclaredPropertySymbol(componentName string, prop declaredProperty) QMLSymbol {
+	return QMLSymbol{
+		Label:      prop.Name,
+		Kind:       lsp.CompletionItemKindProperty,
+		Detail:     prop.Type + " — " + prop.Name + " (" + componentName + ")",
+		Signature:  componentName + "." + prop.Name + ": " + prop.Type,
+		Category:   "property",
+		InsertText: prop.Name + ": ",
 	}
 }
 
@@ -141,6 +241,7 @@ func (w *workspaceIndex) registerURI(uri lsp.DocumentURI) {
 	w.byName[base] = comp
 	w.mu.Unlock()
 	publishWorkspaceSymbol(comp)
+	indexWorkspaceComponentSignature(comp)
 }
 
 func (w *workspaceIndex) all() []workspaceComponent {

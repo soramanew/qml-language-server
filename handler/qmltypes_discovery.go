@@ -205,6 +205,8 @@ func indexPrototype(comp *QMLTypesComponent) {
 func buildInheritanceChains() {
 	protoMu.RLock()
 	defer protoMu.RUnlock()
+	typePropertiesMu.Lock()
+	defer typePropertiesMu.Unlock()
 
 	for _, comp := range protoIndex {
 		qmlName := comp.ExportedName()
@@ -450,8 +452,10 @@ func isInternalName(name string) bool {
 }
 
 // addTypeProperty adds a property to the per-type catalog (typeProperties map)
-// without overwriting existing entries.
+// without overwriting existing entries. Safe to call from any goroutine.
 func addTypeProperty(typeName string, sym QMLSymbol) {
+	typePropertiesMu.Lock()
+	defer typePropertiesMu.Unlock()
 	existing := typeProperties[typeName]
 	for _, e := range existing {
 		if e.Label == sym.Label {
@@ -459,6 +463,22 @@ func addTypeProperty(typeName string, sym QMLSymbol) {
 		}
 	}
 	typeProperties[typeName] = append(typeProperties[typeName], sym)
+}
+
+// setTypeBase records the base-type chain for a QML type. Used by the
+// workspace scanner to plug a user component into the inheritance graph
+// so its body-level completions pick up inherited props. First writer
+// wins so qmltypes discovery remains authoritative for Qt's own types.
+func setTypeBase(typeName string, base []string) {
+	if typeName == "" || len(base) == 0 {
+		return
+	}
+	typePropertiesMu.Lock()
+	defer typePropertiesMu.Unlock()
+	if _, exists := baseTypes[typeName]; exists {
+		return
+	}
+	baseTypes[typeName] = base
 }
 
 func capitalize(s string) string {

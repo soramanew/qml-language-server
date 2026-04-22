@@ -53,12 +53,14 @@ func (h *Handler) Completion(_ context.Context, params *lsp.CompletionParams) (*
 	case ContextAfterColon:
 		items = append(items, getValueCompletions()...)
 		items = append(items, completionItemsByCategory("js")...)
+		items = append(items, h.idCompletions(params.TextDocument.URI, doc)...)
 	default:
 		items = append(items, importedTypeCompletions(imported)...)
 		items = append(items, h.workspaceCompletions()...)
 		items = append(items, qmlKeywords()...)
 		items = append(items, completionItemsByCategory("js")...)
 		items = append(items, completionItemsByCategory("quickshell-snippet")...)
+		items = append(items, h.idCompletions(params.TextDocument.URI, doc)...)
 	}
 
 	return &lsp.CompletionList{
@@ -470,6 +472,46 @@ func (h *Handler) chainMemberCompletions(uri lsp.DocumentURI, lineText string, c
 	return items
 }
 
+// idCompletions returns a completion item for every `id:` binding in the
+// current document so the user can reference siblings and ancestors by id
+// from expression contexts. The detail string carries the enclosing type
+// name (e.g. "Rectangle — id") so the autocomplete pane is self-describing.
+func (h *Handler) idCompletions(uri lsp.DocumentURI, doc string) []lsp.CompletionItem {
+	if h.parser == nil {
+		return nil
+	}
+	tree := h.parser.GetTree(uri)
+	if tree == nil {
+		return nil
+	}
+	root := tree.RootNode()
+	if root == nil {
+		return nil
+	}
+	scopes := buildIDScopeIndex(root, h.parser.Language(), []byte(doc))
+	if len(scopes) == 0 {
+		return nil
+	}
+	kind := lsp.CompletionItemKindVariable
+	items := make([]lsp.CompletionItem, 0, len(scopes))
+	for name, scope := range scopes {
+		detail := "id"
+		if scope.TypeName != "" {
+			detail = scope.TypeName + " — id"
+		}
+		items = append(items, lsp.CompletionItem{
+			Label:  name,
+			Kind:   &kind,
+			Detail: detail,
+			Documentation: &lsp.MarkupContent{
+				Kind:  lsp.Markdown,
+				Value: "**" + name + "** — id\n\nReference to `" + scope.TypeName + "` declared in this file.",
+			},
+		})
+	}
+	return items
+}
+
 // userPropertyCompletions turns a user-declared property map
 // (name → declared type) into CompletionItems. Returns nil when the map is
 // empty so callers can append without branching.
@@ -531,7 +573,7 @@ func identifierChainBeforeDot(text string, pos int) []string {
 // properties).
 func resolvePropertyType(typeName, propName string) string {
 	for _, t := range typeChainList(typeName) {
-		for _, sym := range typeProperties[t] {
+		for _, sym := range lookupTypeProperties(t) {
 			if sym.Label == propName {
 				if rt := extractPropertyType(sym.Signature); rt != "" && isTypeResolvable(rt) {
 					return rt
@@ -569,7 +611,7 @@ func typeChainList(typeName string) []string {
 		}
 		visited[t] = true
 		out = append(out, t)
-		queue = append(queue, baseTypes[t]...)
+		queue = append(queue, lookupBaseTypes(t)...)
 	}
 	return out
 }
