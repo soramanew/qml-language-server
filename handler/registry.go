@@ -146,7 +146,6 @@ func completionItemsByCategory(cats ...string) []lsp.CompletionItem {
 func init() {
 	registerKeywords()
 	registerJSBuiltins()
-	registerQuickshellBuiltins()
 }
 
 func registerKeywords() {

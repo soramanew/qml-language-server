@@ -27,13 +27,16 @@ One file per LSP feature (`hover.go`, `completion.go`, `definition.go`, `referen
 
 - `Handler.documents` — `map[DocumentURI]string` kept in sync by `DidOpen`/`DidChange`/`DidSave`/`DidClose`.
 - `Handler.parser` (`*QMLParser`, `parser.go`) — wraps gotreesitter. Maintains a per-URI `*gotreesitter.Tree`, reparses incrementally via `ParseIncremental` when a previous tree exists.
-- `Handler.workspace` (`*workspaceIndex`, `workspace.go`) — scans workspace roots for `*.qml` files at startup so user-defined components show up in completions and the symbol registry.
+- `Handler.workspace` (`*workspaceIndex`, `workspace.go`) — scans workspace roots for `*.qml` files at startup so user-defined components show up in the symbol registry (used for hover and go-to-definition).
+- `Handler.qmlls` (`*qmllsClient`, `qmlls_client.go`) — a thin LSP client that speaks stdio to Qt's own `qmlls` subprocess. Completion is the only request we forward; document lifecycle notifications (`didOpen`/`didChange`/`didClose`/`didSave`) are mirrored to keep qmlls' view of every open file in sync with ours. When the `qmlls` binary isn't installed the client is nil and `Completion` returns an empty list — the server stays functional for every other feature.
 - `positions.go` — `positionToByte` / `byteOffsetToPosition` convert between LSP `Position` (line/char) and tree-sitter byte offsets, and `findSmallestNodeAt` resolves a cursor position to an AST node. Use these helpers from feature code.
-- `types.go` + `typeproperties.go` — thin accessors around the registry plus the `typeProperties` / `baseTypes` maps. Both maps start empty; they are filled at runtime by qmltypes discovery. No type or property data is hard-coded, so without qmltypes files on disk the LSP has no knowledge of QML types beyond what it can read from the user's own files.
-- `registry.go` — process-wide `QMLSymbol` registry. `registerKeywords`, `registerJSBuiltins`, and `registerQuickshellSnippets` seed the only non-type symbols (QML syntax, JS/Qt globals, Quickshell boilerplate snippets). Types, properties, imports, and inheritance chains are populated by `workspace.go` (local components) and `qmltypes_discovery.go` (Qt modules).
+- `types.go` — thin accessors around the flat symbol registry (`registryTypeInfo` / `registryPropertyInfo`). No per-type property catalog and no inheritance graph are tracked in-process anymore; qmlls owns all of that.
+- `registry.go` — process-wide `QMLSymbol` registry. `registerKeywords` and `registerJSBuiltins` seed keywords and JS/Qt globals so hover has something to show for them. Type/module entries are added at runtime by `qmltypes_discovery.go`.
 - `qmltypes_parser.go` + `qmltypes_types.go` — recursive descent parser for Qt's `.qmltypes` DSL format, producing structured Go types for components, properties, signals, methods, and enums.
 - `qmldir_parser.go` — parses `qmldir` files to discover module name and path to `.qmltypes`.
-- `qmltypes_discovery.go` — at startup, walks Qt install dirs and `QML_IMPORT_PATH` to find and parse every module's type info, then registers the results into the symbol registry without overwriting existing entries.
+- `qmltypes_discovery.go` — at startup, walks Qt install dirs and `QML_IMPORT_PATH` to find and parse every module's type info, then registers each exported type and its module in the flat symbol registry (for hover) and each public method in `functionSignatures` (for signature help). Property catalogs and inheritance chains are intentionally not built — completion is qmlls' responsibility.
+- `completion.go` — a two-line handler that proxies `textDocument/completion` to `Handler.qmlls`. There is no in-process completion logic.
+- `diagnostics.go` — `collectDiagnostics` is a no-op. Tree-sitter's error recovery cascades one typo into a screen full of ERROR nodes, so we rely on qmllint (when installed) for syntax feedback instead of relaying tree-sitter errors.
 
 ### Grammar package (`grammars/`)
 Loads the QML tree-sitter grammar into `gotreesitter`. Two embedded assets are combined at startup by `QmljsLanguage()` (grammars/loader.go):
@@ -45,7 +48,10 @@ Loads the QML tree-sitter grammar into `gotreesitter`. Two embedded assets are c
 Query files in `grammars/queries/` (`highlights.scm`, `locals.scm`) are embedded and used for highlighting; highlights inherit from the `javascript` query set.
 
 ### Diagnostics
-Driven purely by tree-sitter: `collectDiagnostics` walks the tree for ERROR/MISSING nodes. `publishDiagnostics` always normalizes `nil` to `[]lsp.Diagnostic{}` before sending — do not remove that, empty-vs-nil matters for some LSP clients.
+Tree-sitter-derived diagnostics are disabled (`collectDiagnostics` is a no-op); the sole source of diagnostics is qmllint, run on save via `handler.startLint`. `publishDiagnostics` always normalizes `nil` to `[]lsp.Diagnostic{}` before sending — do not remove that, empty-vs-nil matters for some LSP clients.
+
+### Completion
+Completion is delegated wholesale to Qt's `qmlls`. We never generate completion items in-process — no keyword lists, no property catalogs, no id-scope walking. Adding anything to `completion.go` beyond "ask qmlls" is a regression.
 
 ## Notes for editing
 

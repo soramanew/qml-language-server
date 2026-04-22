@@ -30,6 +30,7 @@ type Handler struct {
 	workspace *workspaceIndex
 
 	qmllint *qmllintRunner
+	qmlls   *qmllsClient
 
 	lintMu      sync.Mutex
 	lintCancels map[lsp.DocumentURI]context.CancelFunc
@@ -98,6 +99,13 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 		go h.workspace.scan()
 	}
 	go DiscoverAndRegisterQMLTypes(h.logger, roots)
+	h.qmlls = startQmllsClient(h.logger, roots)
+	completionProvider := (*lsp.CompletionOptions)(nil)
+	if h.qmlls != nil {
+		completionProvider = &lsp.CompletionOptions{
+			TriggerCharacters: []string{".", ":", "<", "\"", "/"},
+		}
+	}
 	return &lsp.InitializeResult{
 		Capabilities: lsp.ServerCapabilities{
 			TextDocumentSync: &lsp.TextDocumentSyncOptions{
@@ -105,10 +113,8 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 				Change:    lsp.SyncFull,
 				Save:      &lsp.SaveOptions{IncludeText: boolPtr(true)},
 			},
-			HoverProvider: boolPtr(true),
-			CompletionProvider: &lsp.CompletionOptions{
-				TriggerCharacters: []string{".", ":", "<", "\"", "/"},
-			},
+			HoverProvider:      boolPtr(true),
+			CompletionProvider: completionProvider,
 			DefinitionProvider:        boolPtr(true),
 			ReferencesProvider:        boolPtr(true),
 			DocumentSymbolProvider:    boolPtr(true),
@@ -140,8 +146,13 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 }
 
 func (h *Handler) Initialized(_ context.Context, _ *lsp.InitializedParams) error { return nil }
-func (h *Handler) Shutdown(_ context.Context) error                              { return nil }
-func (h *Handler) Exit(_ context.Context) error                                  { return nil }
+func (h *Handler) Shutdown(_ context.Context) error {
+	if h.qmlls != nil {
+		h.qmlls.Stop()
+	}
+	return nil
+}
+func (h *Handler) Exit(_ context.Context) error { return nil }
 
 func (h *Handler) publishDiagnostics(uri lsp.DocumentURI, diagnostics []lsp.Diagnostic) {
 	if h.server == nil || h.server.Client == nil {
@@ -227,6 +238,10 @@ func (h *Handler) DidOpen(_ context.Context, params *lsp.DidOpenTextDocumentPara
 	if h.workspace != nil {
 		h.workspace.registerURI(params.TextDocument.URI)
 	}
+	if h.qmlls != nil {
+		h.qmlls.DidOpen(params.TextDocument.URI, params.TextDocument.LanguageID,
+			params.TextDocument.Text, int(params.TextDocument.Version))
+	}
 	return nil
 }
 
@@ -242,6 +257,9 @@ func (h *Handler) DidChange(_ context.Context, params *lsp.DidChangeTextDocument
 	// on disk and arrive after the user has already moved on.
 	h.cancelLint(params.TextDocument.URI)
 	h.reparseAndPublish(params.TextDocument.URI, text)
+	if h.qmlls != nil {
+		h.qmlls.DidChange(params.TextDocument.URI, text, int(params.TextDocument.Version))
+	}
 	return nil
 }
 
@@ -252,6 +270,9 @@ func (h *Handler) DidClose(_ context.Context, params *lsp.DidCloseTextDocumentPa
 		h.parser.Invalidate(params.TextDocument.URI)
 	}
 	h.publishDiagnostics(params.TextDocument.URI, nil)
+	if h.qmlls != nil {
+		h.qmlls.DidClose(params.TextDocument.URI)
+	}
 	return nil
 }
 
@@ -262,6 +283,9 @@ func (h *Handler) DidSave(_ context.Context, params *lsp.DidSaveTextDocumentPara
 	h.setDocument(params.TextDocument.URI, *params.Text)
 	h.reparseAndPublish(params.TextDocument.URI, *params.Text)
 	h.startLint(params.TextDocument.URI)
+	if h.qmlls != nil {
+		h.qmlls.DidSave(params.TextDocument.URI, *params.Text)
+	}
 	return nil
 }
 

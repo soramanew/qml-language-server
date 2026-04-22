@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -61,14 +60,6 @@ func DiscoverAndRegisterQMLTypes(logger *slog.Logger, workspaceRoots []string) {
 			continue
 		}
 		registerQMLTypesModule(mod, dm.moduleName)
-	}
-
-	// Build inheritance chains from the prototype index so
-	// typePropertyCompletions walks inherited properties.
-	buildInheritanceChains()
-
-	if logger != nil {
-		logger.Info("built inheritance chains", "types", len(baseTypes))
 	}
 }
 
@@ -199,55 +190,6 @@ func indexPrototype(comp *QMLTypesComponent) {
 }
 
 
-// buildInheritanceChains walks the prototype index and populates baseTypes
-// for every exported QML type so that typePropertyCompletions can walk
-// inherited properties. Called once after all modules are registered.
-func buildInheritanceChains() {
-	protoMu.RLock()
-	defer protoMu.RUnlock()
-	typePropertiesMu.Lock()
-	defer typePropertiesMu.Unlock()
-
-	for _, comp := range protoIndex {
-		qmlName := comp.ExportedName()
-		if qmlName == "" {
-			continue
-		}
-		// Already has a hand-coded chain — don't overwrite.
-		if _, exists := baseTypes[qmlName]; exists {
-			continue
-		}
-		chain := resolvePrototypeChain(comp.Prototype)
-		if len(chain) > 0 {
-			baseTypes[qmlName] = chain
-		}
-	}
-}
-
-// resolvePrototypeChain walks the prototype field up the C++ inheritance
-// hierarchy and returns QML-visible type names. Stops at QObject or after
-// 32 hops (safety).
-func resolvePrototypeChain(cppPrototype string) []string {
-	var chain []string
-	visited := map[string]bool{}
-	current := cppPrototype
-	for i := 0; i < 32 && current != ""; i++ {
-		if visited[current] {
-			break
-		}
-		visited[current] = true
-		parent, ok := protoIndex[current]
-		if !ok {
-			break
-		}
-		if name := parent.ExportedName(); name != "" {
-			chain = append(chain, name)
-		}
-		current = parent.Prototype
-	}
-	return chain
-}
-
 // registerQMLTypesModule converts parsed qmltypes components into QMLSymbol
 // entries and writes them into the global symbol registry. Existing entries
 // (hard-coded or from earlier modules) are not overwritten — only new
@@ -306,91 +248,31 @@ func registerQMLTypesModule(mod *QMLTypesModule, fallbackModule string) {
 			}
 		}
 
-		// Register type-specific properties from qmltypes.
-		registerQMLTypesProperties(comp, qmlName)
+		// Register enums in the flat symbol registry so hover can find them.
+		for _, e := range comp.Enums {
+			if e.Name == "" {
+				continue
+			}
+			label := qmlName + "." + e.Name
+			if _, exists := lookupSymbol(label); exists {
+				continue
+			}
+			desc := strings.Join(e.Values, ", ")
+			if len(desc) > 120 {
+				desc = desc[:120] + "…"
+			}
+			registerSymbols(QMLSymbol{
+				Label:       label,
+				Kind:        lsp.CompletionItemKindEnum,
+				Detail:      "enum — " + e.Name + " (" + qmlName + ")",
+				Description: desc,
+				Module:      module,
+				Category:    "type",
+			})
+		}
 
 		// Register method signatures for signature help.
 		registerQMLTypesSignatures(comp, qmlName)
-	}
-}
-
-// registerQMLTypesProperties registers properties, signals, methods, and
-// enums from a parsed component as type-specific completions.
-func registerQMLTypesProperties(comp *QMLTypesComponent, qmlName string) {
-	for _, prop := range comp.Properties {
-		if isInternalName(prop.Name) {
-			continue
-		}
-		label := prop.Name
-		qmlType := cppTypeToQML(prop.Type)
-		detail := qmlType + " — " + label + " (" + qmlName + ")"
-		sig := qmlName + "." + label + ": " + qmlType
-		sym := QMLSymbol{
-			Label:      label,
-			Kind:       lsp.CompletionItemKindProperty,
-			Detail:     detail,
-			Signature:  sig,
-			Module:     "",
-			Category:   "property",
-			InsertText: label + ": ",
-		}
-		addTypeProperty(qmlName, sym)
-	}
-
-	for _, sig := range comp.Signals {
-		if isInternalName(sig.Name) {
-			continue
-		}
-		handlerName := "on" + capitalize(sig.Name)
-		detail := "signal — " + sig.Name + " (" + qmlName + ")"
-		sym := QMLSymbol{
-			Label:      handlerName,
-			Kind:       lsp.CompletionItemKindEvent,
-			Detail:     detail,
-			Signature:  formatSignalSignature(sig),
-			Module:     "",
-			Category:   "property",
-			InsertText: handlerName + ": ",
-		}
-		addTypeProperty(qmlName, sym)
-	}
-
-	for _, m := range comp.Methods {
-		if m.Name == "" || m.IsConstructor || m.IsCloned || isInternalName(m.Name) {
-			continue
-		}
-		detail := "method — " + m.Name + " (" + qmlName + ")"
-		sym := QMLSymbol{
-			Label:     m.Name,
-			Kind:      lsp.CompletionItemKindMethod,
-			Detail:    detail,
-			Signature: formatMethodSignature(m),
-			Module:    "",
-			Category:  "property",
-		}
-		addTypeProperty(qmlName, sym)
-	}
-
-	for _, e := range comp.Enums {
-		if e.Name == "" {
-			continue
-		}
-		detail := "enum — " + e.Name + " (" + qmlName + ")"
-		desc := strings.Join(e.Values, ", ")
-		if len(desc) > 120 {
-			desc = desc[:120] + "…"
-		}
-		sym := QMLSymbol{
-			Label:       qmlName + "." + e.Name,
-			Kind:        lsp.CompletionItemKindEnum,
-			Detail:      detail,
-			Description: desc,
-			Module:      "",
-			Category:    "type",
-		}
-		if _, exists := lookupSymbol(sym.Label); !exists {
-			registerSymbols(sym)
-		}
 	}
 }
 
@@ -451,59 +333,3 @@ func isInternalName(name string) bool {
 	return strings.HasPrefix(name, "_")
 }
 
-// addTypeProperty adds a property to the per-type catalog (typeProperties map)
-// without overwriting existing entries. Safe to call from any goroutine.
-func addTypeProperty(typeName string, sym QMLSymbol) {
-	typePropertiesMu.Lock()
-	defer typePropertiesMu.Unlock()
-	existing := typeProperties[typeName]
-	for _, e := range existing {
-		if e.Label == sym.Label {
-			return
-		}
-	}
-	typeProperties[typeName] = append(typeProperties[typeName], sym)
-}
-
-// setTypeBase records the base-type chain for a QML type. Used by the
-// workspace scanner to plug a user component into the inheritance graph
-// so its body-level completions pick up inherited props. First writer
-// wins so qmltypes discovery remains authoritative for Qt's own types.
-func setTypeBase(typeName string, base []string) {
-	if typeName == "" || len(base) == 0 {
-		return
-	}
-	typePropertiesMu.Lock()
-	defer typePropertiesMu.Unlock()
-	if _, exists := baseTypes[typeName]; exists {
-		return
-	}
-	baseTypes[typeName] = base
-}
-
-func capitalize(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
-}
-
-func formatSignalSignature(sig QMLTypesSignal) string {
-	var params []string
-	for _, p := range sig.Parameters {
-		params = append(params, fmt.Sprintf("%s: %s", p.Name, cppTypeToQML(p.Type)))
-	}
-	return "signal " + sig.Name + "(" + strings.Join(params, ", ") + ")"
-}
-
-func formatMethodSignature(m QMLTypesMethod) string {
-	var params []string
-	for _, p := range m.Parameters {
-		params = append(params, fmt.Sprintf("%s: %s", p.Name, cppTypeToQML(p.Type)))
-	}
-	ret := cppTypeToQML(m.ReturnType)
-	if ret == "void" {
-		return "function " + m.Name + "(" + strings.Join(params, ", ") + ")"
-	}
-	return "function " + m.Name + "(" + strings.Join(params, ", ") + "): " + ret
-}

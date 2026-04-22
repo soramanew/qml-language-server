@@ -245,48 +245,12 @@ func TestHoverOnKnownType(t *testing.T) {
 	}
 }
 
-func TestCompletionPopulatesDocumentation(t *testing.T) {
+// TestCompletionReturnsEmptyWithoutQmlls verifies that when qmlls isn't
+// running the completion handler returns an empty list rather than nil or
+// an error — the client expects a valid CompletionList either way.
+func TestCompletionReturnsEmptyWithoutQmlls(t *testing.T) {
 	h := newTestHandler(t, "test://foo.qml", "import QtQuick\n\nRectangle {\n    \n}\n")
-
-	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
-		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-			TextDocument: lsp.TextDocumentIdentifier{URI: "test://foo.qml"},
-			Position:     lsp.Position{Line: 3, Character: 4},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Completion returned error: %v", err)
-	}
-	if list == nil || len(list.Items) == 0 {
-		t.Fatal("Completion returned no items")
-	}
-	// Every item we emit should ship with Detail or Documentation.
-	for _, item := range list.Items {
-		if item.Documentation == nil && item.Detail == "" {
-			t.Errorf("Completion item %q has neither Detail nor Documentation", item.Label)
-		}
-	}
-}
-
-func TestCompletionOffersPropertiesInsideObjectBody(t *testing.T) {
-	// Inject a synthetic base + derived type to drive the chain-aware
-	// completion path without depending on qmltypes discovery.
-	typeProperties["BodyBase"] = []QMLSymbol{
-		{Label: "baseProp", Category: "property", Signature: "BodyBase.baseProp: real"},
-	}
-	typeProperties["BodyDerived"] = []QMLSymbol{
-		{Label: "derivedProp", Category: "property", Signature: "BodyDerived.derivedProp: string"},
-	}
-	baseTypes["BodyDerived"] = []string{"BodyBase"}
-	registerSymbols(QMLSymbol{Label: "BodyDerived", Kind: lsp.CompletionItemKindClass, Module: "FakeModule", Category: "type"})
-	defer func() {
-		delete(typeProperties, "BodyBase")
-		delete(typeProperties, "BodyDerived")
-		delete(baseTypes, "BodyDerived")
-	}()
-
-	doc := "import FakeModule\n\nBodyDerived {\n    \n}\n"
-	h := newTestHandler(t, "test://foo.qml", doc)
+	// newTestHandler doesn't start qmlls (no initialize call) so h.qmlls is nil.
 	list, err := h.Completion(context.Background(), &lsp.CompletionParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 			TextDocument: lsp.TextDocumentIdentifier{URI: "test://foo.qml"},
@@ -296,17 +260,11 @@ func TestCompletionOffersPropertiesInsideObjectBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
-	if list == nil {
-		t.Fatal("Completion returned nil list")
+	if list == nil || list.Items == nil {
+		t.Fatal("expected empty CompletionList, got nil")
 	}
-	labels := map[string]bool{}
-	for _, item := range list.Items {
-		labels[item.Label] = true
-	}
-	for _, want := range []string{"baseProp", "derivedProp"} {
-		if !labels[want] {
-			t.Errorf("expected property %q in %d completions", want, len(list.Items))
-		}
+	if len(list.Items) != 0 {
+		t.Errorf("expected 0 items without qmlls, got %d", len(list.Items))
 	}
 }
 
