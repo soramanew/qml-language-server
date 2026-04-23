@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -199,13 +200,17 @@ func TestQmllintRunnerEndToEnd(t *testing.T) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "Broken.qml")
-	src := "import QtQuick\n\nRectangle {\n    width: 100\n    height: \"not a number\"\n}\n"
-	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+	// Write a CLEAN version on disk, then lint a broken buffer. This exercises
+	// the unsaved-buffer path: if Lint were reading from disk the warning
+	// wouldn't surface. A positive result proves we're linting the buffer.
+	diskSrc := "import QtQuick\n\nRectangle {\n    width: 100\n}\n"
+	if err := os.WriteFile(path, []byte(diskSrc), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	bufSrc := "import QtQuick\n\nRectangle {\n    width: 100\n    height: \"not a number\"\n}\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	diags := runner.Lint(ctx, path, nil)
+	diags := runner.Lint(ctx, path, bufSrc, nil)
 	if len(diags) == 0 {
 		// Qt5 qmllint-only environment would have been rejected at
 		// detectQmllintBinary, but if the detected binary lacks the Qt6 type
@@ -215,6 +220,16 @@ func TestQmllintRunnerEndToEnd(t *testing.T) {
 	for _, d := range diags {
 		if d.Source != "qmllint" {
 			t.Errorf("source = %q, want qmllint", d.Source)
+		}
+	}
+	// The scratch file must be cleaned up — no .qmllsbuf-* leftover in dir.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".qmllsbuf-") {
+			t.Errorf("lint scratch file leaked: %s", e.Name())
 		}
 	}
 }

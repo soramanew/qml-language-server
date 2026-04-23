@@ -19,6 +19,11 @@ import (
 // we give up and show tree-sitter diagnostics only.
 const qmllintTimeout = 10 * time.Second
 
+// qmllintDebounce is how long we wait after the last keystroke before firing
+// a lint. Short enough that diagnostics feel live; long enough that a bursty
+// typist doesn't spawn a subprocess per keystroke.
+const qmllintDebounce = 400 * time.Millisecond
+
 type Handler struct {
 	logger *slog.Logger
 
@@ -35,6 +40,7 @@ type Handler struct {
 
 	lintMu      sync.Mutex
 	lintCancels map[lsp.DocumentURI]context.CancelFunc
+	lintTimers  map[lsp.DocumentURI]*time.Timer
 }
 
 func New(logger *slog.Logger) *Handler {
@@ -50,6 +56,7 @@ func New(logger *slog.Logger) *Handler {
 		qmllint:     newQmllintRunner(logger),
 		qmlformat:   newQmlformatRunner(logger),
 		lintCancels: make(map[lsp.DocumentURI]context.CancelFunc),
+		lintTimers:  make(map[lsp.DocumentURI]*time.Timer),
 	}
 }
 
@@ -128,8 +135,14 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 			RenameProvider: &lsp.RenameOptions{
 				PrepareProvider: boolPtr(true),
 			},
-			DiagnosticProvider: &lsp.DiagnosticOptions{},
-			InlayHintProvider:  &lsp.InlayHintOptions{},
+			// DiagnosticProvider is intentionally omitted: qmllint is async and
+			// can take >1s, so we publish diagnostics via the push model
+			// (textDocument/publishDiagnostics). Advertising pull would make
+			// clients call textDocument/diagnostic on every keystroke and
+			// expect an immediate, authoritative response — they'd overwrite
+			// our debounced push results with whatever the synchronous pull
+			// returned, which in our case is nothing.
+			InlayHintProvider: &lsp.InlayHintOptions{},
 			SemanticTokensProvider: &lsp.SemanticTokensOptions{
 				Legend: SemanticTokensLegend(),
 				Full:   &lsp.SemanticTokensFull{},
@@ -169,24 +182,33 @@ func (h *Handler) publishDiagnostics(uri lsp.DocumentURI, diagnostics []lsp.Diag
 	})
 }
 
-func (h *Handler) reparseAndPublish(uri lsp.DocumentURI, text string) {
+// reparse updates the tree-sitter tree for uri. It used to also publish
+// diagnostics, but tree-sitter diagnostics are intentionally a no-op (qmllint
+// is our only source) and publishing an empty list on every keystroke blanks
+// the editor's lint display until the debounced qmllint run catches up.
+// Now the sole diagnostics publisher is startLint.
+func (h *Handler) reparse(uri lsp.DocumentURI, text string) {
 	if h.parser == nil {
 		return
 	}
 	h.parser.Parse(uri, text)
-	h.publishDiagnostics(uri, h.getDiagnostics(uri))
 }
 
-// startLint kicks off a background qmllint run for uri. A previous in-flight
-// lint for the same URI is cancelled first so we never surface stale results
-// after the user keeps typing. Safe to call when qmllint is unavailable or
-// the URI isn't a local file — both are no-ops.
+// startLint kicks off a background qmllint run for uri, linting the current
+// in-memory buffer text (not the on-disk file). A previous in-flight lint for
+// the same URI is cancelled first so we never surface stale results after the
+// user keeps typing. Safe to call when qmllint is unavailable, the URI isn't
+// a local file, or the document isn't open — all are no-ops.
 func (h *Handler) startLint(uri lsp.DocumentURI) {
 	if h.qmllint == nil {
 		return
 	}
 	path := uriToPath(uri)
 	if path == "" {
+		return
+	}
+	source, ok := h.getDocument(uri)
+	if !ok {
 		return
 	}
 	importPaths := h.lintImportPaths(path)
@@ -197,7 +219,7 @@ func (h *Handler) startLint(uri lsp.DocumentURI) {
 	h.lintMu.Unlock()
 	go func() {
 		defer cancel()
-		lintDiags := h.qmllint.Lint(ctx, path, importPaths)
+		lintDiags := h.qmllint.Lint(ctx, path, source, importPaths)
 		if ctx.Err() != nil {
 			return
 		}
@@ -224,9 +246,33 @@ func (h *Handler) startLint(uri lsp.DocumentURI) {
 	}()
 }
 
+// scheduleLint defers startLint until the user has been idle for `delay`.
+// Every call resets the timer, so a bursty typist only triggers qmllint once
+// after they pause. Safe to call when qmllint isn't installed — no-op.
+func (h *Handler) scheduleLint(uri lsp.DocumentURI, delay time.Duration) {
+	if h.qmllint == nil {
+		return
+	}
+	h.lintMu.Lock()
+	if t, ok := h.lintTimers[uri]; ok {
+		t.Stop()
+	}
+	h.lintTimers[uri] = time.AfterFunc(delay, func() {
+		h.lintMu.Lock()
+		delete(h.lintTimers, uri)
+		h.lintMu.Unlock()
+		h.startLint(uri)
+	})
+	h.lintMu.Unlock()
+}
+
 func (h *Handler) cancelLint(uri lsp.DocumentURI) {
 	h.lintMu.Lock()
 	defer h.lintMu.Unlock()
+	if t, ok := h.lintTimers[uri]; ok {
+		t.Stop()
+		delete(h.lintTimers, uri)
+	}
 	if cancel, ok := h.lintCancels[uri]; ok {
 		cancel()
 		delete(h.lintCancels, uri)
@@ -235,7 +281,7 @@ func (h *Handler) cancelLint(uri lsp.DocumentURI) {
 
 func (h *Handler) DidOpen(_ context.Context, params *lsp.DidOpenTextDocumentParams) error {
 	h.setDocument(params.TextDocument.URI, params.TextDocument.Text)
-	h.reparseAndPublish(params.TextDocument.URI, params.TextDocument.Text)
+	h.reparse(params.TextDocument.URI, params.TextDocument.Text)
 	h.startLint(params.TextDocument.URI)
 	if h.workspace != nil {
 		h.workspace.registerURI(params.TextDocument.URI)
@@ -255,10 +301,17 @@ func (h *Handler) DidChange(_ context.Context, params *lsp.DidChangeTextDocument
 	}
 	text := params.ContentChanges[len(params.ContentChanges)-1].Text
 	h.setDocument(params.TextDocument.URI, text)
-	// Cancel any in-flight lint: its results would reflect the pre-edit file
-	// on disk and arrive after the user has already moved on.
+	// Cancel any in-flight lint: its results reflect a pre-edit snapshot and
+	// must not overwrite fresher diagnostics. Reparse the tree so hover,
+	// go-to-def, etc. stay accurate, but do NOT publish diagnostics here —
+	// publishing an empty list on every keystroke would blank the editor's
+	// lint display until the 400ms debounce completes, causing a visible
+	// flash. Instead, leave the prior qmllint results on screen (slightly
+	// stale, at most for qmllintDebounce), and let the scheduled lint push
+	// the fresh set when it finishes.
 	h.cancelLint(params.TextDocument.URI)
-	h.reparseAndPublish(params.TextDocument.URI, text)
+	h.reparse(params.TextDocument.URI, text)
+	h.scheduleLint(params.TextDocument.URI, qmllintDebounce)
 	if h.qmlls != nil {
 		h.qmlls.DidChange(params.TextDocument.URI, text, int(params.TextDocument.Version))
 	}
@@ -283,7 +336,7 @@ func (h *Handler) DidSave(_ context.Context, params *lsp.DidSaveTextDocumentPara
 		return nil
 	}
 	h.setDocument(params.TextDocument.URI, *params.Text)
-	h.reparseAndPublish(params.TextDocument.URI, *params.Text)
+	h.reparse(params.TextDocument.URI, *params.Text)
 	h.startLint(params.TextDocument.URI)
 	if h.qmlls != nil {
 		h.qmlls.DidSave(params.TextDocument.URI, *params.Text)
@@ -329,14 +382,6 @@ func (h *Handler) DocumentHighlight(_ context.Context, params *lsp.DocumentHighl
 		return true
 	})
 	return highlights, nil
-}
-
-func (h *Handler) DocumentDiagnostic(_ context.Context, params *lsp.DocumentDiagnosticParams) (any, error) {
-	diagnostics := h.getDiagnostics(params.TextDocument.URI)
-	if diagnostics == nil {
-		diagnostics = []lsp.Diagnostic{}
-	}
-	return lsp.FullDocumentDiagnosticReport{Items: diagnostics}, nil
 }
 
 func (h *Handler) getDiagnostics(uri lsp.DocumentURI) []lsp.Diagnostic {

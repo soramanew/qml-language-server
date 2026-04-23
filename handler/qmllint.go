@@ -88,15 +88,25 @@ func detectQmllintBinary() string {
 	return ""
 }
 
-// Lint runs qmllint on path and returns diagnostics for every warning in its
-// output. Each entry in importPaths is forwarded as `-I <path>` so qmllint
-// can resolve project-local QML modules the same way we do for completion.
-// Non-zero exit codes are expected (qmllint exits 1 on warnings), so we
-// ignore exit status and key off successfully-parsed JSON instead.
-func (r *qmllintRunner) Lint(ctx context.Context, path string, importPaths []string) []lsp.Diagnostic {
+// Lint runs qmllint against the given source text and returns diagnostics for
+// every warning in its output. qmllint only accepts file paths (the `--json -`
+// flag writes the report to stdout — it does not mean "read source from
+// stdin"), so to lint unsaved editor buffers we write `source` to a hidden
+// temp file beside the real file and point qmllint at that. Writing in the
+// same directory (rather than /tmp) preserves qmllint's implicit-module
+// lookup, which resolves sibling QML components like `MyButton.qml` by
+// directory. If the temp write fails (read-only mount, etc.) we lint the
+// on-disk file instead — diagnostics may be stale but it beats returning
+// nothing. Each entry in importPaths is forwarded as `-I <path>` so qmllint
+// can locate project-local QML modules the same way qmlls does for
+// completion. Non-zero exit codes are expected (qmllint exits 1 on warnings),
+// so we ignore exit status and key off successfully-parsed JSON instead.
+func (r *qmllintRunner) Lint(ctx context.Context, path, source string, importPaths []string) []lsp.Diagnostic {
 	if r == nil || r.binary == "" || path == "" {
 		return nil
 	}
+	lintPath, cleanup := stageLintBuffer(path, source)
+	defer cleanup()
 	args := make([]string, 0, 3+2*len(importPaths))
 	args = append(args, "--json", "-")
 	for _, p := range importPaths {
@@ -105,7 +115,7 @@ func (r *qmllintRunner) Lint(ctx context.Context, path string, importPaths []str
 		}
 		args = append(args, "-I", p)
 	}
-	args = append(args, path)
+	args = append(args, lintPath)
 	cmd := exec.CommandContext(ctx, r.binary, args...)
 	cmd.Dir = filepath.Dir(path)
 	var stdout, stderr bytes.Buffer
@@ -130,6 +140,32 @@ func (r *qmllintRunner) Lint(ctx context.Context, path string, importPaths []str
 		return nil
 	}
 	return diagnosticsFromReport(&report)
+}
+
+// stageLintBuffer writes source to a hidden temp file next to path so qmllint
+// can lint an unsaved editor buffer. Returns the path to use for linting and
+// a cleanup func the caller must defer. On any I/O failure we fall back to
+// the original path with a no-op cleanup — stale-but-real is strictly better
+// than no diagnostics at all. The `.qmllsbuf-` prefix is hidden on unix and
+// starts with a dot, which guarantees it can never be treated as an implicit
+// QML component (component filenames must begin with an uppercase letter).
+func stageLintBuffer(path, source string) (string, func()) {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".qmllsbuf-*.qml")
+	if err != nil {
+		return path, func() {}
+	}
+	tmp := f.Name()
+	if _, err := f.WriteString(source); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return path, func() {}
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return path, func() {}
+	}
+	return tmp, func() { os.Remove(tmp) }
 }
 
 func diagnosticsFromReport(report *qmllintReport) []lsp.Diagnostic {
