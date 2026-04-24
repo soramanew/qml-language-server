@@ -34,9 +34,10 @@ type Handler struct {
 	server    *server.Server
 	workspace *workspaceIndex
 
-	qmllint   *qmllintRunner
-	qmlls     *qmllsClient
-	qmlformat *qmlformatRunner
+	qmllint     *qmllintRunner
+	qmlls       *qmllsClient
+	qmlformat   *qmlformatRunner
+	conventions *conventionsRunner
 
 	lintMu      sync.Mutex
 	lintCancels map[lsp.DocumentURI]context.CancelFunc
@@ -55,6 +56,7 @@ func New(logger *slog.Logger) *Handler {
 		workspace:   newWorkspaceIndex(),
 		qmllint:     newQmllintRunner(logger),
 		qmlformat:   newQmlformatRunner(logger),
+		conventions: newConventionsRunner(logger),
 		lintCancels: make(map[lsp.DocumentURI]context.CancelFunc),
 		lintTimers:  make(map[lsp.DocumentURI]*time.Timer),
 	}
@@ -106,6 +108,9 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 	if h.workspace != nil {
 		h.workspace.setRoots(roots)
 		go h.workspace.scan()
+	}
+	if h.conventions != nil {
+		h.conventions.SetRoots(roots)
 	}
 	go DiscoverAndRegisterQMLTypes(h.logger, roots)
 	h.qmlls = startQmllsClient(h.logger, roots)
@@ -340,6 +345,17 @@ func (h *Handler) DidSave(_ context.Context, params *lsp.DidSaveTextDocumentPara
 	h.startLint(params.TextDocument.URI)
 	if h.qmlls != nil {
 		h.qmlls.DidSave(params.TextDocument.URI, *params.Text)
+	}
+	// Fire-and-forget: the conventions script may walk the whole project and
+	// rewrite files in place. The editor picks up the resulting disk changes
+	// through its own file watcher, so we don't read its output. Running in
+	// a goroutine keeps the save response snappy on large projects.
+	if h.conventions != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), conventionsTimeout)
+			defer cancel()
+			h.conventions.Run(ctx)
+		}()
 	}
 	return nil
 }

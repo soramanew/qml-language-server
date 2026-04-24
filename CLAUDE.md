@@ -56,6 +56,9 @@ Completion is delegated wholesale to Qt's `qmlls`. We never generate completion 
 ### Formatting
 Formatting is delegated to Qt's `qmlformat` via `handler/qmlformat.go`. Each request writes the current document to a temp file, runs qmlformat, and returns the stdout as a single whole-document TextEdit. When the binary isn't on the system the capability is omitted from Initialize and the handler returns no edits. Do not add an in-process formatter — qmlformat is the source of truth.
 
+### Post-save conventions script
+If the project ships `scripts/qml-lint-conventions.py` under any workspace root, `DidSave` fires it asynchronously after the lint run. `handler/qmlconventions.go` exec's `<script> --fix` with cwd=project root (no file argument — the real script walks every `*.qml` under its cwd and rewrites each in place). We don't read stdout or touch the result: disk changes flow back to the editor through its own file watcher. Strictly best-effort — missing script is a silent no-op, a failing subprocess is logged and otherwise ignored; a broken convention tool must never block a save.
+
 ## Notes for editing
 
 - When adding a new LSP method, update both `Handler.Initialize`'s capabilities and add the method on `Handler`.
