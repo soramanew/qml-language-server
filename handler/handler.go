@@ -152,9 +152,7 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 		h.workspace.setRoots(roots)
 		go h.workspace.scan()
 	}
-	if h.conventions != nil {
-		h.conventions.SetRoots(roots)
-	}
+	h.conventions.SetRoots(roots)
 	// Safety net for a client that never sends `initialized`: late
 	// diagnostics beat none.
 	time.AfterFunc(h.initFallback, h.markInitialized)
@@ -329,11 +327,51 @@ func (h *Handler) reparse(uri lsp.DocumentURI, text string) {
 	h.parser.Parse(uri, text)
 }
 
+// diagProducer is one external checker's contribution to a diagnostic
+// round: what to run, how long to give it, and which cache key its result
+// lands under.
+type diagProducer struct {
+	source  string
+	timeout time.Duration
+	check   func(ctx context.Context) []lsp.Diagnostic
+}
+
+// diagProducers returns the checkers available for path/source. The
+// per-project scripts are probed here, once per round, rather than inside a
+// goroutine — findScript hits the filesystem.
+func (h *Handler) diagProducers(uri lsp.DocumentURI, path, source string) []diagProducer {
+	var producers []diagProducer
+	if h.qmllint != nil {
+		importPaths := h.lintImportPaths(path)
+		producers = append(producers, diagProducer{
+			source:  diagSourceQmllint,
+			timeout: qmllintTimeout,
+			check: func(ctx context.Context) []lsp.Diagnostic {
+				// Tree-sitter rides along rather than publishing on its own:
+				// collectDiagnostics is a no-op, so an eager publish would
+				// put an empty list on the wire for nothing.
+				return append(h.getDiagnostics(uri), h.qmllint.Lint(ctx, path, source, importPaths)...)
+			},
+		})
+	}
+	if h.conventions.findScript() != "" {
+		producers = append(producers, diagProducer{
+			source:  diagSourceConventions,
+			timeout: conventionsCheckTimeout,
+			check: func(ctx context.Context) []lsp.Diagnostic {
+				return h.conventions.Check(ctx, source)
+			},
+		})
+	}
+	return producers
+}
+
 // startDiagnostics runs every external checker — qmllint and the conventions
-// script — over the in-memory buffer, concurrently under one cancellable
-// round, each publishing as it finishes. Any in-flight round for the URI is
-// cancelled first so stale results can't land. No-op when neither tool is
-// available, the URI isn't a local file, or the document isn't open.
+// script — over the in-memory buffer,
+// concurrently under one cancellable round, each publishing as it finishes.
+// Any in-flight round for the URI is cancelled first so stale results can't
+// land. No-op when no tool is available, the URI isn't a local file, or the
+// document isn't open.
 func (h *Handler) startDiagnostics(uri lsp.DocumentURI) {
 	path := uriToPath(uri)
 	if path == "" {
@@ -343,10 +381,8 @@ func (h *Handler) startDiagnostics(uri lsp.DocumentURI) {
 	if !ok {
 		return
 	}
-	runQmllint := h.qmllint != nil
-	// findScript hits the filesystem; ask once, not per round in a goroutine.
-	runConventions := h.conventions != nil && h.conventions.findScript() != ""
-	if !runQmllint && !runConventions {
+	producers := h.diagProducers(uri, path, source)
+	if len(producers) == 0 {
 		return
 	}
 
@@ -358,38 +394,20 @@ func (h *Handler) startDiagnostics(uri lsp.DocumentURI) {
 	h.lintMu.Unlock()
 
 	var wg sync.WaitGroup
-	if runQmllint {
-		importPaths := h.lintImportPaths(path)
+	for _, p := range producers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			lintCtx, lintCancel := context.WithTimeout(ctx, qmllintTimeout)
-			defer lintCancel()
-			diags := h.qmllint.Lint(lintCtx, path, source, importPaths)
+			checkCtx, checkCancel := context.WithTimeout(ctx, p.timeout)
+			defer checkCancel()
+			diags := p.check(checkCtx)
 			// If the user edited meanwhile, DidChange cancelled this round
 			// and a newer one owns the display — don't overwrite it with
 			// results for the previous text.
 			if ctx.Err() != nil {
 				return
 			}
-			// Tree-sitter rides along rather than publishing on its own:
-			// collectDiagnostics is a no-op, so an eager publish would put
-			// an empty list on the wire for nothing.
-			combined := append(h.getDiagnostics(uri), diags...)
-			h.setDiagnostics(uri, diagSourceQmllint, combined)
-		}()
-	}
-	if runConventions {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			checkCtx, checkCancel := context.WithTimeout(ctx, conventionsCheckTimeout)
-			defer checkCancel()
-			diags := h.conventions.Check(checkCtx, source)
-			if ctx.Err() != nil {
-				return
-			}
-			h.setDiagnostics(uri, diagSourceConventions, diags)
+			h.setDiagnostics(uri, p.source, diags)
 		}()
 	}
 

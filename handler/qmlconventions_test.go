@@ -109,8 +109,8 @@ func TestConventionsRunnerCheckParsesStderrReport(t *testing.T) {
 	proj := t.TempDir()
 	argsFile := filepath.Join(proj, "args")
 	report := `{"violations": [` +
-		`{"file": "<stdin>", "line": 2, "rule": "import-order", "message": "wrong order"},` +
-		`{"file": "<stdin>", "line": 4, "rule": "section-order", "message": "wrong section"}` +
+		`{"file": "<stdin>", "line": 2, "column": 1, "endLine": 2, "endColumn": 17, "rule": "import-order", "message": "wrong order"},` +
+		`{"file": "<stdin>", "line": 4, "column": 5, "endLine": 4, "endColumn": 13, "rule": "section-order", "message": "wrong section"}` +
 		`]}`
 	writeConventionsScript(t, proj, checkScript(argsFile, report, 1))
 
@@ -136,7 +136,8 @@ func TestConventionsRunnerCheckParsesStderrReport(t *testing.T) {
 	if string(first.Code) != `"import-order"` {
 		t.Errorf("Code = %s, want \"import-order\"", first.Code)
 	}
-	// Line 2 (1-based) is `import qs.config`, 16 characters wide.
+	// Line 2 (1-based) is `import qs.config`, 16 characters wide. The
+	// script's end column is exclusive, so 1..17 is the whole line.
 	want := lsp.Range{
 		Start: lsp.Position{Line: 1, Character: 0},
 		End:   lsp.Position{Line: 1, Character: 16},
@@ -144,8 +145,13 @@ func TestConventionsRunnerCheckParsesStderrReport(t *testing.T) {
 	if first.Range != want {
 		t.Errorf("Range = %+v, want %+v", first.Range, want)
 	}
-	if got := diags[1].Range.Start.Line; got != 3 {
-		t.Errorf("second diagnostic line = %d, want 3", got)
+	// The script spans the line's content, so the range skips the indent.
+	wantSecond := lsp.Range{
+		Start: lsp.Position{Line: 3, Character: 4},
+		End:   lsp.Position{Line: 3, Character: 12},
+	}
+	if diags[1].Range != wantSecond {
+		t.Errorf("second Range = %+v, want %+v", diags[1].Range, wantSecond)
 	}
 
 	// Unfixed: --fix reports against the source it rewrote, whose lines
@@ -221,8 +227,10 @@ func TestConventionsRunnerCheckNoScript(t *testing.T) {
 func TestConventionsDiagnosticsClampsLines(t *testing.T) {
 	source := "Item {\n}\n"
 	violations := []conventionsViolation{
-		{Line: 0, Rule: "file-structure", Message: "whole file"},
-		{Line: 99, Rule: "section-order", Message: "past the end"},
+		{scriptRange: scriptRange{Line: 0, Column: 1, EndLine: 0, EndColumn: 7},
+			Rule: "file-structure", Message: "whole file"},
+		{scriptRange: scriptRange{Line: 99, Column: 1, EndLine: 99, EndColumn: 7},
+			Rule: "section-order", Message: "past the end"},
 	}
 	diags := conventionsDiagnostics(violations, source)
 	if len(diags) != 2 {
