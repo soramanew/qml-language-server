@@ -14,11 +14,11 @@ import (
 	"github.com/owenrumney/go-lsp/lsp"
 )
 
-// scriptLocator is the shared half of a project-shipped checker script:
-// resolve a project-relative path against the workspace roots, and run the
-// script over an unsaved buffer. Scripts are matched by path only — no
-// contents or shebang check — so a project can swap in anything speaking
-// the same flags.
+// scriptLocator is the shared half of every project-shipped checker script
+// (`qml-lint-conventions.py`, `trs-check.py`): resolve a project-relative
+// path against the workspace roots, and run the script over an unsaved
+// buffer. Scripts are matched by path only — no contents or shebang check —
+// so a project can swap in anything speaking the same flags.
 type scriptLocator struct {
 	relPath string
 	logger  *slog.Logger
@@ -68,9 +68,9 @@ func projectRoot(script string) string {
 }
 
 // checkBuffer runs the script with args and source piped in on stdin, and
-// returns its stderr report. The report goes to stderr — stdout is reserved
-// for fixed source — and the script exits non-zero on any finding, so exit
-// status is ignored and callers key off parseable JSON.
+// returns its stderr report. Both scripts write the report to stderr —
+// stdout is reserved for fixed source — and both exit non-zero on any
+// finding, so exit status is ignored and callers key off parseable JSON.
 // Returns nil when the script is missing, or the run was cancelled.
 func (s *scriptLocator) checkBuffer(ctx context.Context, source string, args ...string) []byte {
 	script := s.find()
@@ -90,9 +90,9 @@ func (s *scriptLocator) checkBuffer(ctx context.Context, source string, args ...
 	return bytes.TrimSpace(stderr.Bytes())
 }
 
-// scriptRange is the position a checker script reports: a 1-based line and
+// scriptRange is the position both scripts report: a 1-based line and
 // column for each end, with the end exclusive — an LSP range in 1-based
-// clothing. Embedded in the script's own report type, whose remaining
+// clothing. Embedded in each script's own report type, whose remaining
 // fields differ.
 type scriptRange struct {
 	Line      int `json:"line"`
@@ -102,10 +102,10 @@ type scriptRange struct {
 }
 
 // reportedRange converts a reported range into an LSP one — the same range,
-// shifted to 0-based — clamped to the buffer. The script is trusted to pick
-// a sensible extent (the conventions script spans the offending line's
-// content), so the clamping is defence against a report that raced an edit,
-// not second-guessing. Nothing is ever dropped for being out of range: a
+// shifted to 0-based — clamped to the buffer. The scripts are trusted to
+// pick a sensible extent (the conventions script spans the offending line's
+// content, trs-check the offending call), so the clamping is defence against
+// a report that raced an edit, not second-guessing. Nothing is ever dropped for being out of range: a
 // line the buffer no longer has falls back to the whole of the first line,
 // columns past the end of a line that shrank clamp to it, and a range that
 // comes out empty or inverted widens to the end of its line, since a

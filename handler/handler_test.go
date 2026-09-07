@@ -278,6 +278,7 @@ func newTestHandler(t *testing.T, uri lsp.DocumentURI, text string) *Handler {
 	// qmllint staging file can outlive t.TempDir's cleanup.
 	h.qmllint = nil
 	h.conventions = nil
+	h.trscheck = nil
 	if err := h.DidOpen(context.Background(), &lsp.DidOpenTextDocumentParams{
 		TextDocument: lsp.TextDocumentItem{URI: uri, Text: text},
 	}); err != nil {

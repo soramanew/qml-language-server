@@ -43,6 +43,7 @@ type Handler struct {
 	qmlls       *qmllsClient
 	qmlformat   *qmlformatRunner
 	conventions *conventionsRunner
+	trscheck    *trsCheckRunner
 
 	// lintMu guards the in-flight/pending bookkeeping for diagnostic runs.
 	lintMu      sync.Mutex
@@ -71,7 +72,7 @@ type diagnosticRun struct {
 
 // diagSources is the publish order of the producers. A fixed slice rather
 // than map order, so editors don't reshuffle their problem lists.
-var diagSources = []string{diagSourceQmllint, diagSourceConventions}
+var diagSources = []string{diagSourceQmllint, diagSourceConventions, diagSourceTrsCheck}
 
 func New(logger *slog.Logger) *Handler {
 	parser := NewQMLParser()
@@ -87,6 +88,7 @@ func New(logger *slog.Logger) *Handler {
 		qmllint:      newQmllintRunner(logger),
 		qmlformat:    newQmlformatRunner(logger),
 		conventions:  newConventionsRunner(logger),
+		trscheck:     newTrsCheckRunner(logger),
 		lintCancels:  make(map[lsp.DocumentURI]*diagnosticRun),
 		lintTimers:   make(map[lsp.DocumentURI]*time.Timer),
 		diagBySource: make(map[lsp.DocumentURI]map[string][]lsp.Diagnostic),
@@ -153,6 +155,7 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 		go h.workspace.scan()
 	}
 	h.conventions.SetRoots(roots)
+	h.trscheck.SetRoots(roots)
 	// Safety net for a client that never sends `initialized`: late
 	// diagnostics beat none.
 	time.AfterFunc(h.initFallback, h.markInitialized)
@@ -363,11 +366,20 @@ func (h *Handler) diagProducers(uri lsp.DocumentURI, path, source string) []diag
 			},
 		})
 	}
+	if h.trscheck.findScript() != "" {
+		producers = append(producers, diagProducer{
+			source:  diagSourceTrsCheck,
+			timeout: trsCheckTimeout,
+			check: func(ctx context.Context) []lsp.Diagnostic {
+				return h.trscheck.Check(ctx, path, source)
+			},
+		})
+	}
 	return producers
 }
 
-// startDiagnostics runs every external checker — qmllint and the conventions
-// script — over the in-memory buffer,
+// startDiagnostics runs every external checker — qmllint, the conventions
+// script and the translation checker — over the in-memory buffer,
 // concurrently under one cancellable round, each publishing as it finishes.
 // Any in-flight round for the URI is cancelled first so stale results can't
 // land. No-op when no tool is available, the URI isn't a local file, or the
