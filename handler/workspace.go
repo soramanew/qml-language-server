@@ -79,10 +79,17 @@ func (w *workspaceIndex) scan() {
 		})
 	}
 
+	// Publish from a snapshot: `found` is now the live w.byName, so
+	// iterating it outside the lock races registerURI (DidOpen during the
+	// scan), and a concurrent map read/write kills the process outright.
 	w.mu.Lock()
 	w.byName = found
-	w.mu.Unlock()
+	components := make([]workspaceComponent, 0, len(found))
 	for _, c := range found {
+		components = append(components, c)
+	}
+	w.mu.Unlock()
+	for _, c := range components {
 		publishWorkspaceSymbol(c)
 	}
 }
