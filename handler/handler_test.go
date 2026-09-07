@@ -274,6 +274,10 @@ func newTestHandler(t *testing.T, uri lsp.DocumentURI, text string) *Handler {
 	if h.parser == nil {
 		t.Skip("parser unavailable in test environment")
 	}
+	// Language-feature tests: switch off the diagnostic producers, whose
+	// qmllint staging file can outlive t.TempDir's cleanup.
+	h.qmllint = nil
+	h.conventions = nil
 	if err := h.DidOpen(context.Background(), &lsp.DidOpenTextDocumentParams{
 		TextDocument: lsp.TextDocumentItem{URI: uri, Text: text},
 	}); err != nil {

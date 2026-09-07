@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -18,6 +19,10 @@ import (
 // second; ten seconds is a generous cap to cover very large projects before
 // we give up and show tree-sitter diagnostics only.
 const qmllintTimeout = 10 * time.Second
+
+// initializedFallback is how long we wait for the client's `initialized`
+// notification before letting diagnostics flow anyway.
+const initializedFallback = 2 * time.Second
 
 // qmllintDebounce is how long we wait after the last keystroke before firing
 // a lint. Short enough that diagnostics feel live; long enough that a bursty
@@ -39,10 +44,34 @@ type Handler struct {
 	qmlformat   *qmlformatRunner
 	conventions *conventionsRunner
 
+	// lintMu guards the in-flight/pending bookkeeping for diagnostic runs.
 	lintMu      sync.Mutex
-	lintCancels map[lsp.DocumentURI]context.CancelFunc
+	lintCancels map[lsp.DocumentURI]*diagnosticRun
 	lintTimers  map[lsp.DocumentURI]*time.Timer
+
+	// initMu guards initialized, which gates diagnostic delivery — see
+	// publishDiagnostics.
+	initMu      sync.Mutex
+	initialized bool
+	// initFallback is a per-handler copy so tests can push it out of reach.
+	initFallback time.Duration
+
+	// diagMu guards diagBySource: the last diagnostics each producer
+	// reported per URI. See setDiagnostics.
+	diagMu       sync.Mutex
+	diagBySource map[lsp.DocumentURI]map[string][]lsp.Diagnostic
 }
+
+// diagnosticRun is one round of diagnostic subprocesses for a URI;
+// cancelling it cancels every tool in the round. A pointer type so a
+// finishing round can check by identity that it's still the current one.
+type diagnosticRun struct {
+	cancel context.CancelFunc
+}
+
+// diagSources is the publish order of the producers. A fixed slice rather
+// than map order, so editors don't reshuffle their problem lists.
+var diagSources = []string{diagSourceQmllint, diagSourceConventions}
 
 func New(logger *slog.Logger) *Handler {
 	parser := NewQMLParser()
@@ -50,19 +79,27 @@ func New(logger *slog.Logger) *Handler {
 		logger.Error("failed to load QML grammar; all language features will be disabled")
 	}
 	return &Handler{
-		logger:      logger,
-		documents:   make(map[lsp.DocumentURI]string),
-		parser:      parser,
-		workspace:   newWorkspaceIndex(),
-		qmllint:     newQmllintRunner(logger),
-		qmlformat:   newQmlformatRunner(logger),
-		conventions: newConventionsRunner(logger),
-		lintCancels: make(map[lsp.DocumentURI]context.CancelFunc),
-		lintTimers:  make(map[lsp.DocumentURI]*time.Timer),
+		logger:       logger,
+		initFallback: initializedFallback,
+		documents:    make(map[lsp.DocumentURI]string),
+		parser:       parser,
+		workspace:    newWorkspaceIndex(),
+		qmllint:      newQmllintRunner(logger),
+		qmlformat:    newQmlformatRunner(logger),
+		conventions:  newConventionsRunner(logger),
+		lintCancels:  make(map[lsp.DocumentURI]*diagnosticRun),
+		lintTimers:   make(map[lsp.DocumentURI]*time.Timer),
+		diagBySource: make(map[lsp.DocumentURI]map[string][]lsp.Diagnostic),
 	}
 }
 
+// Serve runs the server over stdio. The wiring lives in serve so tests can
+// drive the same registration path over a pipe.
 func (h *Handler) Serve(ctx context.Context) error {
+	return h.serve(ctx, server.RunStdio())
+}
+
+func (h *Handler) serve(ctx context.Context, rw io.ReadWriteCloser) error {
 	h.server = server.NewServer(h)
 	// Override go-lsp's built-in shutdown handler: its default returns untyped
 	// nil, which makes the response omit `result` entirely, and Neovim rejects
@@ -79,7 +116,13 @@ func (h *Handler) Serve(ctx context.Context) error {
 		os.Exit(0)
 		return nil
 	})
-	return h.server.Run(ctx, server.RunStdio())
+	// go-lsp registers its own no-op for `initialized` and never dispatches
+	// to Handler.Initialized, so claim it explicitly — without this the
+	// handshake never completes and every diagnostic is dropped.
+	h.server.HandleNotification("initialized", func(ctx context.Context, _ json.RawMessage) error {
+		return h.Initialized(ctx, nil)
+	})
+	return h.server.Run(ctx, rw)
 }
 
 // getDocument returns the current text for uri. Returns "", false when the
@@ -112,6 +155,9 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 	if h.conventions != nil {
 		h.conventions.SetRoots(roots)
 	}
+	// Safety net for a client that never sends `initialized`: late
+	// diagnostics beat none.
+	time.AfterFunc(h.initFallback, h.markInitialized)
 	go DiscoverAndRegisterQMLTypes(h.logger, roots)
 	h.qmlls = startQmllsClient(h.logger, roots)
 	completionProvider := (*lsp.CompletionOptions)(nil)
@@ -127,8 +173,8 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 				Change:    lsp.SyncFull,
 				Save:      &lsp.SaveOptions{IncludeText: boolPtr(true)},
 			},
-			HoverProvider:      boolPtr(true),
-			CompletionProvider: completionProvider,
+			HoverProvider:             boolPtr(true),
+			CompletionProvider:        completionProvider,
 			DefinitionProvider:        boolPtr(true),
 			ReferencesProvider:        boolPtr(true),
 			DocumentSymbolProvider:    boolPtr(true),
@@ -165,7 +211,42 @@ func (h *Handler) Initialize(_ context.Context, params *lsp.InitializeParams) (*
 	}, nil
 }
 
-func (h *Handler) Initialized(_ context.Context, _ *lsp.InitializedParams) error { return nil }
+// Initialized marks the handshake complete — the client sends it only after
+// processing our initialize response, so it's the first moment we may push.
+func (h *Handler) Initialized(_ context.Context, _ *lsp.InitializedParams) error {
+	h.markInitialized()
+	return nil
+}
+
+// markInitialized opens the gate and flushes what was produced meanwhile.
+// Idempotent: the notification and the fallback timer race by design.
+func (h *Handler) markInitialized() {
+	h.initMu.Lock()
+	already := h.initialized
+	h.initialized = true
+	h.initMu.Unlock()
+	if already {
+		return
+	}
+	for uri, diags := range h.snapshotDiagnostics() {
+		h.publishDiagnostics(uri, diags)
+	}
+}
+
+// snapshotDiagnostics returns the merged cache for every URI, for replay.
+func (h *Handler) snapshotDiagnostics() map[lsp.DocumentURI][]lsp.Diagnostic {
+	h.diagMu.Lock()
+	defer h.diagMu.Unlock()
+	out := make(map[lsp.DocumentURI][]lsp.Diagnostic, len(h.diagBySource))
+	for uri, bySource := range h.diagBySource {
+		var merged []lsp.Diagnostic
+		for _, s := range diagSources {
+			merged = append(merged, bySource[s]...)
+		}
+		out[uri] = merged
+	}
+	return out
+}
 func (h *Handler) Shutdown(_ context.Context) error {
 	if h.qmlls != nil {
 		h.qmlls.Stop()
@@ -178,6 +259,17 @@ func (h *Handler) publishDiagnostics(uri lsp.DocumentURI, diagnostics []lsp.Diag
 	if h.server == nil || h.server.Client == nil {
 		return
 	}
+	// Publishing before the client has processed our initialize response is
+	// a protocol violation that makes Node clients destroy the connection,
+	// and go-lsp dispatches every message on its own goroutine so a fast
+	// producer can beat a slow Initialize onto the wire. Dropping is safe:
+	// the results stay cached and Initialized flushes them.
+	h.initMu.Lock()
+	ready := h.initialized
+	h.initMu.Unlock()
+	if !ready {
+		return
+	}
 	if diagnostics == nil {
 		diagnostics = []lsp.Diagnostic{}
 	}
@@ -187,11 +279,49 @@ func (h *Handler) publishDiagnostics(uri lsp.DocumentURI, diagnostics []lsp.Diag
 	})
 }
 
+// setDiagnostics records one producer's latest result and republishes the
+// union. publishDiagnostics replaces the client's whole list per URI, so a
+// producer publishing alone would erase the other's findings.
+func (h *Handler) setDiagnostics(uri lsp.DocumentURI, source string, diags []lsp.Diagnostic) {
+	h.publishDiagnostics(uri, h.cacheDiagnostics(uri, source, diags))
+}
+
+// cacheDiagnostics records diags under source for uri and returns the union
+// of every producer, in diagSources order.
+func (h *Handler) cacheDiagnostics(uri lsp.DocumentURI, source string, diags []lsp.Diagnostic) []lsp.Diagnostic {
+	h.diagMu.Lock()
+	bySource, ok := h.diagBySource[uri]
+	if !ok {
+		bySource = make(map[string][]lsp.Diagnostic, len(diagSources))
+		h.diagBySource[uri] = bySource
+	}
+	bySource[source] = diags
+	total := 0
+	for _, s := range diagSources {
+		total += len(bySource[s])
+	}
+	merged := make([]lsp.Diagnostic, 0, total)
+	for _, s := range diagSources {
+		merged = append(merged, bySource[s]...)
+	}
+	h.diagMu.Unlock()
+	return merged
+}
+
+// clearDiagnostics drops the cache for uri and clears the client's display,
+// so a reopened file doesn't inherit the last session's diagnostics.
+func (h *Handler) clearDiagnostics(uri lsp.DocumentURI) {
+	h.diagMu.Lock()
+	delete(h.diagBySource, uri)
+	h.diagMu.Unlock()
+	h.publishDiagnostics(uri, nil)
+}
+
 // reparse updates the tree-sitter tree for uri. It used to also publish
 // diagnostics, but tree-sitter diagnostics are intentionally a no-op (qmllint
 // is our only source) and publishing an empty list on every keystroke blanks
 // the editor's lint display until the debounced qmllint run catches up.
-// Now the sole diagnostics publisher is startLint.
+// Diagnostics are now published only by startDiagnostics' producers.
 func (h *Handler) reparse(uri lsp.DocumentURI, text string) {
 	if h.parser == nil {
 		return
@@ -199,15 +329,12 @@ func (h *Handler) reparse(uri lsp.DocumentURI, text string) {
 	h.parser.Parse(uri, text)
 }
 
-// startLint kicks off a background qmllint run for uri, linting the current
-// in-memory buffer text (not the on-disk file). A previous in-flight lint for
-// the same URI is cancelled first so we never surface stale results after the
-// user keeps typing. Safe to call when qmllint is unavailable, the URI isn't
-// a local file, or the document isn't open — all are no-ops.
-func (h *Handler) startLint(uri lsp.DocumentURI) {
-	if h.qmllint == nil {
-		return
-	}
+// startDiagnostics runs every external checker — qmllint and the conventions
+// script — over the in-memory buffer, concurrently under one cancellable
+// round, each publishing as it finishes. Any in-flight round for the URI is
+// cancelled first so stale results can't land. No-op when neither tool is
+// available, the URI isn't a local file, or the document isn't open.
+func (h *Handler) startDiagnostics(uri lsp.DocumentURI) {
 	path := uriToPath(uri)
 	if path == "" {
 		return
@@ -216,48 +343,72 @@ func (h *Handler) startLint(uri lsp.DocumentURI) {
 	if !ok {
 		return
 	}
-	importPaths := h.lintImportPaths(path)
-	h.cancelLint(uri)
-	ctx, cancel := context.WithTimeout(context.Background(), qmllintTimeout)
+	runQmllint := h.qmllint != nil
+	// findScript hits the filesystem; ask once, not per round in a goroutine.
+	runConventions := h.conventions != nil && h.conventions.findScript() != ""
+	if !runQmllint && !runConventions {
+		return
+	}
+
+	h.cancelDiagnostics(uri)
+	ctx, cancel := context.WithCancel(context.Background())
+	run := &diagnosticRun{cancel: cancel}
 	h.lintMu.Lock()
-	h.lintCancels[uri] = cancel
+	h.lintCancels[uri] = run
 	h.lintMu.Unlock()
+
+	var wg sync.WaitGroup
+	if runQmllint {
+		importPaths := h.lintImportPaths(path)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lintCtx, lintCancel := context.WithTimeout(ctx, qmllintTimeout)
+			defer lintCancel()
+			diags := h.qmllint.Lint(lintCtx, path, source, importPaths)
+			// If the user edited meanwhile, DidChange cancelled this round
+			// and a newer one owns the display — don't overwrite it with
+			// results for the previous text.
+			if ctx.Err() != nil {
+				return
+			}
+			// Tree-sitter rides along rather than publishing on its own:
+			// collectDiagnostics is a no-op, so an eager publish would put
+			// an empty list on the wire for nothing.
+			combined := append(h.getDiagnostics(uri), diags...)
+			h.setDiagnostics(uri, diagSourceQmllint, combined)
+		}()
+	}
+	if runConventions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			checkCtx, checkCancel := context.WithTimeout(ctx, conventionsCheckTimeout)
+			defer checkCancel()
+			diags := h.conventions.Check(checkCtx, source)
+			if ctx.Err() != nil {
+				return
+			}
+			h.setDiagnostics(uri, diagSourceConventions, diags)
+		}()
+	}
+
 	go func() {
-		defer cancel()
-		lintDiags := h.qmllint.Lint(ctx, path, source, importPaths)
-		if ctx.Err() != nil {
-			return
-		}
-		tsDiags := h.getDiagnostics(uri)
-		// Re-check after the (possibly slow) subprocess returned: if the user
-		// edited the file in the meantime DidChange cancelled our context and
-		// already republished fresh tree-sitter diagnostics — we must not
-		// overwrite those with lint results tied to the previous text.
-		if ctx.Err() != nil {
-			return
-		}
-		combined := make([]lsp.Diagnostic, 0, len(tsDiags)+len(lintDiags))
-		combined = append(combined, tsDiags...)
-		combined = append(combined, lintDiags...)
-		h.publishDiagnostics(uri, combined)
-		// Only clear our own entry. If something cancelled us between publish
-		// and now and then installed a newer lint, we'd otherwise delete that
-		// newer run's cancel and leak a goroutine past DidClose.
+		wg.Wait()
+		cancel()
+		// By identity: if a newer round was installed after we were
+		// cancelled, deleting blindly would leak its subprocesses.
 		h.lintMu.Lock()
-		if ctx.Err() == nil {
+		if h.lintCancels[uri] == run {
 			delete(h.lintCancels, uri)
 		}
 		h.lintMu.Unlock()
 	}()
 }
 
-// scheduleLint defers startLint until the user has been idle for `delay`.
-// Every call resets the timer, so a bursty typist only triggers qmllint once
-// after they pause. Safe to call when qmllint isn't installed — no-op.
-func (h *Handler) scheduleLint(uri lsp.DocumentURI, delay time.Duration) {
-	if h.qmllint == nil {
-		return
-	}
+// scheduleDiagnostics defers startDiagnostics until the user is idle for
+// `delay`. Every call resets the timer, so a bursty typist spawns one round.
+func (h *Handler) scheduleDiagnostics(uri lsp.DocumentURI, delay time.Duration) {
 	h.lintMu.Lock()
 	if t, ok := h.lintTimers[uri]; ok {
 		t.Stop()
@@ -266,20 +417,23 @@ func (h *Handler) scheduleLint(uri lsp.DocumentURI, delay time.Duration) {
 		h.lintMu.Lock()
 		delete(h.lintTimers, uri)
 		h.lintMu.Unlock()
-		h.startLint(uri)
+		h.startDiagnostics(uri)
 	})
 	h.lintMu.Unlock()
 }
 
-func (h *Handler) cancelLint(uri lsp.DocumentURI) {
+// cancelDiagnostics drops a pending round for uri and cancels an in-flight
+// one. Cached results are left alone — keeping stale diagnostics beats
+// blanking the display until a fresh round lands.
+func (h *Handler) cancelDiagnostics(uri lsp.DocumentURI) {
 	h.lintMu.Lock()
 	defer h.lintMu.Unlock()
 	if t, ok := h.lintTimers[uri]; ok {
 		t.Stop()
 		delete(h.lintTimers, uri)
 	}
-	if cancel, ok := h.lintCancels[uri]; ok {
-		cancel()
+	if run, ok := h.lintCancels[uri]; ok {
+		run.cancel()
 		delete(h.lintCancels, uri)
 	}
 }
@@ -287,7 +441,7 @@ func (h *Handler) cancelLint(uri lsp.DocumentURI) {
 func (h *Handler) DidOpen(_ context.Context, params *lsp.DidOpenTextDocumentParams) error {
 	h.setDocument(params.TextDocument.URI, params.TextDocument.Text)
 	h.reparse(params.TextDocument.URI, params.TextDocument.Text)
-	h.startLint(params.TextDocument.URI)
+	h.startDiagnostics(params.TextDocument.URI)
 	if h.workspace != nil {
 		h.workspace.registerURI(params.TextDocument.URI)
 	}
@@ -314,9 +468,9 @@ func (h *Handler) DidChange(_ context.Context, params *lsp.DidChangeTextDocument
 	// flash. Instead, leave the prior qmllint results on screen (slightly
 	// stale, at most for qmllintDebounce), and let the scheduled lint push
 	// the fresh set when it finishes.
-	h.cancelLint(params.TextDocument.URI)
+	h.cancelDiagnostics(params.TextDocument.URI)
 	h.reparse(params.TextDocument.URI, text)
-	h.scheduleLint(params.TextDocument.URI, qmllintDebounce)
+	h.scheduleDiagnostics(params.TextDocument.URI, qmllintDebounce)
 	if h.qmlls != nil {
 		h.qmlls.DidChange(params.TextDocument.URI, text, int(params.TextDocument.Version))
 	}
@@ -325,11 +479,11 @@ func (h *Handler) DidChange(_ context.Context, params *lsp.DidChangeTextDocument
 
 func (h *Handler) DidClose(_ context.Context, params *lsp.DidCloseTextDocumentParams) error {
 	h.deleteDocument(params.TextDocument.URI)
-	h.cancelLint(params.TextDocument.URI)
+	h.cancelDiagnostics(params.TextDocument.URI)
 	if h.parser != nil {
 		h.parser.Invalidate(params.TextDocument.URI)
 	}
-	h.publishDiagnostics(params.TextDocument.URI, nil)
+	h.clearDiagnostics(params.TextDocument.URI)
 	if h.qmlls != nil {
 		h.qmlls.DidClose(params.TextDocument.URI)
 	}
@@ -342,7 +496,7 @@ func (h *Handler) DidSave(_ context.Context, params *lsp.DidSaveTextDocumentPara
 	}
 	h.setDocument(params.TextDocument.URI, *params.Text)
 	h.reparse(params.TextDocument.URI, *params.Text)
-	h.startLint(params.TextDocument.URI)
+	h.startDiagnostics(params.TextDocument.URI)
 	if h.qmlls != nil {
 		h.qmlls.DidSave(params.TextDocument.URI, *params.Text)
 	}

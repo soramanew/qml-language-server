@@ -4,7 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/owenrumney/go-lsp/lsp"
 )
 
 // writeConventionsScript drops an executable shell script at
@@ -85,5 +89,151 @@ func TestConventionsRunnerFindScriptReturnsEmptyWhenMissing(t *testing.T) {
 	c.SetRoots([]string{proj})
 	if got := c.findScript(); got != "" {
 		t.Errorf("findScript = %q, want empty", got)
+	}
+}
+
+// checkScript is a fake conventions script: it drains stdin (so our stdin
+// copy never sees EPIPE), records its arguments, and writes `report` to
+// stderr, where the real script puts it.
+func checkScript(argsFile, report string, exit int) string {
+	return "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" > " + argsFile + "\n" +
+		"cat > /dev/null\n" +
+		"printf '%s' '" + report + "' >&2\n" +
+		"exit " + strconv.Itoa(exit) + "\n"
+}
+
+// TestConventionsRunnerCheckParsesStderrReport: JSON on stderr becomes
+// diagnostics, spanning the whole line since the script reports no column.
+func TestConventionsRunnerCheckParsesStderrReport(t *testing.T) {
+	proj := t.TempDir()
+	argsFile := filepath.Join(proj, "args")
+	report := `{"violations": [` +
+		`{"file": "<stdin>", "line": 2, "rule": "import-order", "message": "wrong order"},` +
+		`{"file": "<stdin>", "line": 4, "rule": "section-order", "message": "wrong section"}` +
+		`]}`
+	writeConventionsScript(t, proj, checkScript(argsFile, report, 1))
+
+	c := newConventionsRunner(nil)
+	c.SetRoots([]string{proj})
+	source := "import QtQuick\nimport qs.config\nItem {\n    id: root\n}\n"
+	diags := c.Check(context.Background(), source)
+
+	if len(diags) != 2 {
+		t.Fatalf("got %d diagnostics, want 2: %+v", len(diags), diags)
+	}
+	// Exit 1 is normal on any finding; it must not suppress results.
+	first := diags[0]
+	if first.Message != "wrong order" {
+		t.Errorf("Message = %q, want %q", first.Message, "wrong order")
+	}
+	if first.Source != diagSourceConventions {
+		t.Errorf("Source = %q, want %q", first.Source, diagSourceConventions)
+	}
+	if first.Severity == nil || *first.Severity != lsp.SeverityWarning {
+		t.Errorf("Severity = %v, want warning", first.Severity)
+	}
+	if string(first.Code) != `"import-order"` {
+		t.Errorf("Code = %s, want \"import-order\"", first.Code)
+	}
+	// Line 2 (1-based) is `import qs.config`, 16 characters wide.
+	want := lsp.Range{
+		Start: lsp.Position{Line: 1, Character: 0},
+		End:   lsp.Position{Line: 1, Character: 16},
+	}
+	if first.Range != want {
+		t.Errorf("Range = %+v, want %+v", first.Range, want)
+	}
+	if got := diags[1].Range.Start.Line; got != 3 {
+		t.Errorf("second diagnostic line = %d, want 3", got)
+	}
+
+	// Unfixed: --fix reports against the source it rewrote, whose lines
+	// don't match the editor's buffer.
+	gotArgs, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if strings.TrimSpace(string(gotArgs)) != "--file - --json" {
+		t.Errorf("args = %q, want %q", strings.TrimSpace(string(gotArgs)), "--file - --json")
+	}
+}
+
+// TestConventionsRunnerCheckPipesBufferOnStdin: the unsaved buffer reaches
+// the script, rather than it re-reading the file on disk.
+func TestConventionsRunnerCheckPipesBufferOnStdin(t *testing.T) {
+	proj := t.TempDir()
+	stdinFile := filepath.Join(proj, "stdin")
+	writeConventionsScript(t, proj,
+		"#!/bin/sh\ncat > "+stdinFile+"\nprintf '%s' '{\"violations\": []}' >&2\n")
+
+	c := newConventionsRunner(nil)
+	c.SetRoots([]string{proj})
+	source := "// unsaved edit\nItem {}\n"
+	if diags := c.Check(context.Background(), source); diags != nil {
+		t.Errorf("Check = %+v, want nil for an empty report", diags)
+	}
+
+	got, err := os.ReadFile(stdinFile)
+	if err != nil {
+		t.Fatalf("read stdin capture: %v", err)
+	}
+	if string(got) != source {
+		t.Errorf("script stdin = %q, want %q", string(got), source)
+	}
+}
+
+// TestConventionsRunnerCheckToleratesJunk: an unexpected script yields no
+// diagnostics rather than an error.
+func TestConventionsRunnerCheckToleratesJunk(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"not json", "#!/bin/sh\ncat > /dev/null\necho 'boom: not json' >&2\nexit 2\n"},
+		{"silent", "#!/bin/sh\ncat > /dev/null\n"},
+		{"crashes", "#!/bin/sh\nexit 127\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proj := t.TempDir()
+			writeConventionsScript(t, proj, tt.body)
+			c := newConventionsRunner(nil)
+			c.SetRoots([]string{proj})
+			if diags := c.Check(context.Background(), "Item {}\n"); diags != nil {
+				t.Errorf("Check = %+v, want nil", diags)
+			}
+		})
+	}
+}
+
+// TestConventionsRunnerCheckNoScript: no script, no work — the common case.
+func TestConventionsRunnerCheckNoScript(t *testing.T) {
+	c := newConventionsRunner(nil)
+	c.SetRoots([]string{t.TempDir()})
+	if diags := c.Check(context.Background(), "Item {}\n"); diags != nil {
+		t.Errorf("Check = %+v, want nil", diags)
+	}
+}
+
+// TestConventionsDiagnosticsClampsLines: lines the buffer doesn't have — 0,
+// or past the end — pin to line 0 rather than being dropped.
+func TestConventionsDiagnosticsClampsLines(t *testing.T) {
+	source := "Item {\n}\n"
+	violations := []conventionsViolation{
+		{Line: 0, Rule: "file-structure", Message: "whole file"},
+		{Line: 99, Rule: "section-order", Message: "past the end"},
+	}
+	diags := conventionsDiagnostics(violations, source)
+	if len(diags) != 2 {
+		t.Fatalf("got %d diagnostics, want 2", len(diags))
+	}
+	for i, d := range diags {
+		if d.Range.Start.Line != 0 {
+			t.Errorf("diags[%d] line = %d, want 0", i, d.Range.Start.Line)
+		}
+		if d.Range.End.Character != len("Item {") {
+			t.Errorf("diags[%d] end char = %d, want %d", i, d.Range.End.Character, len("Item {"))
+		}
 	}
 }

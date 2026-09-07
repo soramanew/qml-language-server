@@ -101,6 +101,10 @@ func detectQmllintBinary() string {
 // can locate project-local QML modules the same way qmlls does for
 // completion. Non-zero exit codes are expected (qmllint exits 1 on warnings),
 // so we ignore exit status and key off successfully-parsed JSON instead.
+// diagSourceQmllint is the `source` field stamped on every qmllint
+// diagnostic, and its key in the handler's per-source diagnostic cache.
+const diagSourceQmllint = "qmllint"
+
 func (r *qmllintRunner) Lint(ctx context.Context, path, source string, importPaths []string) []lsp.Diagnostic {
 	if r == nil || r.binary == "" || path == "" {
 		return nil
@@ -202,7 +206,7 @@ func warningToDiagnostic(w qmllintWarning) lsp.Diagnostic {
 			End:   lsp.Position{Line: line, Character: col + length},
 		},
 		Severity: &severity,
-		Source:   "qmllint",
+		Source:   diagSourceQmllint,
 		Message:  w.Message,
 	}
 	if w.ID != "" {
